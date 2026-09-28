@@ -5,7 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 RUNNER_PATH="${RUNNER_PATH:-$HOME/.local/share/lutris/runners/wine/GE-Proton11-custom}"
-PFX_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/iocp_test_pfx"
+# One throwaway prefix per runner: switching Wine builds inside one prefix triggers prefix updates.
+PFX_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/iocp_test_pfx_$(basename "$RUNNER_PATH")"
+
+# Same thread-priority handling as the game's launch wrapper: without these, Wine 11 maps
+# thread priorities to negative nice values, so the benchmarks would outrank a running game.
+export WINE_DISABLE_THREAD_NICE=1 WINE_DISABLE_MAIN_THREAD_BOOST=1
 
 export PATH="$RUNNER_PATH/files/bin:$PATH"
 export WINESERVER="${WINESERVER:-$RUNNER_PATH/files/bin/wineserver}"
@@ -34,11 +39,9 @@ mkdir -p "$PFX_DIR"
 rm -f "$PFX_DIR/pfx/drive_c/test_iocp_suite.log"
 
 PROT_EXIT=0
-if ! STEAM_COMPAT_DATA_PATH="$PFX_DIR" \
-     STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam" \
-     "$RUNNER_PATH/proton" run "$SCRIPT_DIR/test_iocp_suite.exe" "$@"; then
-    PROT_EXIT=$?
-fi
+STEAM_COMPAT_DATA_PATH="$PFX_DIR" \
+STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam" \
+    "$RUNNER_PATH/proton" run "$SCRIPT_DIR/test_iocp_suite.exe" "$@" > "$PFX_DIR.proton.log" 2>&1 || PROT_EXIT=$?
 
 if [ -f "$PFX_DIR/pfx/drive_c/test_iocp_suite.log" ]; then
     cat "$PFX_DIR/pfx/drive_c/test_iocp_suite.log"

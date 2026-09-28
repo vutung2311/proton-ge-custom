@@ -12,8 +12,9 @@
 
 static FILE *log_file = NULL;
 
+/* The log file only: under `proton run` the console stdout is not drained, and a flush to it
+ * blocks forever (run_iocp_suite.sh prints the log file afterwards). */
 #define LOG_PRINT(fmt, ...) do { \
-    printf(fmt, ##__VA_ARGS__); fflush(stdout); \
     if (log_file) { fprintf(log_file, fmt, ##__VA_ARGS__); fflush(log_file); } \
 } while(0)
 
@@ -2267,6 +2268,122 @@ static DWORD WINAPI woa_test32_worker(LPVOID p) {
     return 0;
 }
 
+// -------------------------------------------------------------------------
+// TEST 35: Port fallback semantics (direct wait, handle alias, close, timeout, depth)
+// Must pass identically with in-process ports and with server-only ports.
+// -------------------------------------------------------------------------
+struct t35_wait_arg {
+    HANDLE port;
+    DWORD timeout_ms;
+    BOOL result;
+    DWORD err;
+    double elapsed_ms;
+};
+
+static DWORD WINAPI t35_waiter(LPVOID param) {
+    struct t35_wait_arg *a = (struct t35_wait_arg *)param;
+    LARGE_INTEGER f, s, e;
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    LPOVERLAPPED ov = NULL;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&s);
+    a->result = GetQueuedCompletionStatus(a->port, &bytes, &key, &ov, a->timeout_ms);
+    a->err = a->result ? 0 : GetLastError();
+    QueryPerformanceCounter(&e);
+    a->elapsed_ms = (e.QuadPart - s.QuadPart) * 1000.0 / f.QuadPart;
+    return 0;
+}
+
+static int run_test_port_fallback_semantics(void) {
+    typedef LONG (NTAPI *pfnNtQueryIoCompletion)(HANDLE, int, PVOID, ULONG, PULONG);
+    pfnNtQueryIoCompletion pNtQueryIoCompletion =
+        (pfnNtQueryIoCompletion)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryIoCompletion");
+    DWORD bytes;
+    ULONG_PTR key;
+    LPOVERLAPPED ov;
+    int failures = 0;
+
+    LOG_PRINT("[TEST 35] Port fallback semantics (direct wait, handle alias, close, timeout, depth)... ");
+
+    // (a) queue depth, then a direct wait on the port handle: signaled while packets are queued,
+    // and the packets are still delivered in order afterwards
+    HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    for (ULONG_PTR k = 1; k <= 3; k++) PostQueuedCompletionStatus(port, 10, k, NULL);
+    ULONG depth = 0;
+    if (!pNtQueryIoCompletion || pNtQueryIoCompletion(port, 0, &depth, sizeof(depth), NULL) != 0 || depth != 3) {
+        LOG_PRINT("\n  (a) queue depth %lu, expected 3", depth);
+        failures++;
+    }
+    DWORD w = WaitForSingleObject(port, 0);
+    if (w != WAIT_OBJECT_0) {
+        LOG_PRINT("\n  (a) direct wait with 3 queued packets returned %lu, expected WAIT_OBJECT_0", w);
+        failures++;
+    }
+    for (ULONG_PTR k = 1; k <= 3; k++) {
+        key = 0;
+        if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, 1000) || key != k) {
+            LOG_PRINT("\n  (a) packet %lu after the direct wait: key %lu", (unsigned long)k, (unsigned long)key);
+            failures++;
+            break;
+        }
+    }
+    CloseHandle(port);
+
+    // (b) the two low bits of a handle value are ignored
+    port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    PostQueuedCompletionStatus((HANDLE)((ULONG_PTR)port | 1), 20, 0xb0b, NULL);
+    key = 0;
+    if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, 1000) || key != 0xb0b) {
+        LOG_PRINT("\n  (b) post through handle|1 not seen through handle: key %lx, err %lu",
+                  (unsigned long)key, GetLastError());
+        failures++;
+    }
+    CloseHandle(port);
+
+    // (c) closing the port wakes a blocked waiter with ERROR_ABANDONED_WAIT_0
+    struct t35_wait_arg arg = { CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0), INFINITE };
+    HANDLE t = CreateThread(NULL, 0, t35_waiter, &arg, 0, NULL);
+    Sleep(50);
+    CloseHandle(arg.port);
+    if (WaitForSingleObject(t, 2000) != WAIT_OBJECT_0) {
+        LOG_PRINT("\n  (c) waiter still blocked 2 s after CloseHandle");
+        failures++;
+    } else if (arg.result || arg.err != ERROR_ABANDONED_WAIT_0) {
+        LOG_PRINT("\n  (c) waiter returned %d err %lu, expected ERROR_ABANDONED_WAIT_0", arg.result, arg.err);
+        failures++;
+    }
+    CloseHandle(t);
+
+    // (d) binding a file while a thread waits: the waiter keeps its original deadline
+    char dir[MAX_PATH], path[MAX_PATH];
+    GetTempPathA(MAX_PATH, dir);
+    GetTempFileNameA(dir, "t35", 0, path);
+    HANDLE file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    struct t35_wait_arg darg = { CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0), 600 };
+    t = CreateThread(NULL, 0, t35_waiter, &darg, 0, NULL);
+    Sleep(300);
+    if (file == INVALID_HANDLE_VALUE || CreateIoCompletionPort(file, darg.port, 0x5, 0) != darg.port) {
+        LOG_PRINT("\n  (d) could not bind a file: err %lu", GetLastError());
+        failures++;
+    }
+    WaitForSingleObject(t, 5000);
+    if (darg.result || darg.err != WAIT_TIMEOUT || darg.elapsed_ms < 590 || darg.elapsed_ms > 800) {
+        LOG_PRINT("\n  (d) 600 ms wait with a bind at 300 ms: result %d err %lu after %.1f ms",
+                  darg.result, darg.err, darg.elapsed_ms);
+        failures++;
+    }
+    CloseHandle(t);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    CloseHandle(darg.port);
+
+    if (failures) LOG_PRINT("\n  FAILED (%d checks)\n", failures);
+    else LOG_PRINT("PASSED\n");
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     int total_failures = 0;
     bool run_conformance = true;
@@ -3857,6 +3974,7 @@ int main(int argc, char **argv) {
             LOG_PRINT("PASSED (Bound-FD in-process dequeue and 0-deadlock multi-threaded WaitOnAddress)\n");
         }
     } while (0);
+    if (run_test_port_fallback_semantics() != 0) total_failures++;
     } /* end if (run_conformance) */
 
     if (run_repro) {
