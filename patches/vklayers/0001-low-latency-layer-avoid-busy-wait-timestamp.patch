@@ -1,0 +1,119 @@
+diff --git a/src/timestamp_pool.cc b/src/timestamp_pool.cc
+index ba7a6e1..custom 100644
+--- a/src/timestamp_pool.cc
++++ b/src/timestamp_pool.cc
+@@ -150,30 +150,60 @@
+ TimestampPool::Handle::~Handle() {}
+ 
+ void TimestampPool::do_reaper(const std::stop_token stoken) {
++    auto backoff_ms = 1;
++
+     for (;;) {
+         auto lock = std::unique_lock{this->mutex};
+-        this->cv.wait(lock, stoken,
+-                      [&]() { return !this->expiring_handles.empty(); });
++
++        if (this->expiring_handles.empty()) {
++            this->cv.wait(lock, stoken,
++                          [&]() { return !this->expiring_handles.empty(); });
++            backoff_ms = 1;
++        }
+ 
+         // Keep going and free everything before destructing.
+         if (stoken.stop_requested() && this->expiring_handles.empty()) {
+             break;
+         }
+ 
+-        const auto handle_ptr = this->expiring_handles.front();
+-        this->expiring_handles.pop_front();
++        // Batched draining of all completed handles in FIFO submission order.
++        bool made_progress = false;
++        while (!this->expiring_handles.empty()) {
++            const auto handle_ptr = this->expiring_handles.front();
++
++            if (stoken.stop_requested()) {
++                this->expiring_handles.pop_front();
++                handle_ptr->query_chunk.free_indices.insert(handle_ptr->query_index);
++                delete handle_ptr;
++                made_progress = true;
++                continue;
++            }
++
++            // If handle was never submitted, or if GPU timestamp is ready:
++            if (!handle_ptr->was_submitted.load(std::memory_order_relaxed) ||
++                handle_ptr->has_end()) {
++                this->expiring_handles.pop_front();
++                handle_ptr->query_chunk.free_indices.insert(handle_ptr->query_index);
++                delete handle_ptr;
++                made_progress = true;
++            } else {
++                // Front handle is still executing on GPU
++                break;
++            }
++        }
+ 
+-        // Allow more to go on the queue while we wait for it to finish.
+-        lock.unlock();
+-        // Only wait if the timestamp commands actually made it to the GPU.
+-        if (handle_ptr->was_submitted.load(std::memory_order_relaxed)) {
+-            handle_ptr->await_end();
++        if (made_progress) {
++            backoff_ms = 1;
+         }
+ 
+-        // Lock our mutex, allow the queue to use it again and delete it.
+-        lock.lock();
+-        handle_ptr->query_chunk.free_indices.insert(handle_ptr->query_index);
+-        delete handle_ptr;
++        // If handles are still in-flight on the GPU, wait with adaptive backoff
++        // on cv instead of spinning in tight sub-millisecond sleeps.
++        if (!this->expiring_handles.empty() && !stoken.stop_requested()) {
++            this->cv.wait_for(lock, std::chrono::milliseconds(backoff_ms));
++            if (backoff_ms < 8) {
++                backoff_ms *= 2;
++            }
++        }
+     }
+ }
+ 
+@@ -198,12 +228,34 @@
+ 
+     auto query_result = std::array<std::uint64_t, 2>{};
+ 
+-    THROW_NOT_VKSUCCESS(vtable.GetQueryPoolResults(
+-        context.device, query_pool, this->query_index + offset, 1,
+-        sizeof(query_result), &query_result, sizeof(query_result),
+-        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
+-            VK_QUERY_RESULT_WAIT_BIT));
+-    assert(query_result[1]);
++    int attempts = 0;
++    while (true) {
++        const auto res = vtable.GetQueryPoolResults(
++            context.device, query_pool, this->query_index + offset, 1,
++            sizeof(query_result), &query_result, sizeof(query_result),
++            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++
++        if (res == VK_SUCCESS && query_result[1]) {
++            break;
++        }
++        if (res != VK_NOT_READY && res != VK_SUCCESS) {
++            throw res;
++        }
++
++        if (++attempts < 64) {
++#if defined(__x86_64__) || defined(__i386__)
++            __builtin_ia32_pause();
++#else
++            std::this_thread::yield();
++#endif
++        } else if (attempts < 128) {
++            std::this_thread::yield();
++        } else if (attempts < 256) {
++            std::this_thread::sleep_for(std::chrono::microseconds(250));
++        } else {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        }
++    }
+ 
+     const auto& ticks = query_result[0];
+     assert(context.clock);

@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: proton-ge-custom <noreply@localhost>
+Date: Mon, 28 Sep 2026 13:00:00 +0700
+Subject: [PATCH] wineboot: env gates for SystemBiosDate and CentralProcessor FeatureSet
+
+Wine 11 writes HKLM\\HARDWARE\\DESCRIPTION\\System\\SystemBiosDate = "01/01/70" (Wine 10 did
+not) and reports a different CentralProcessor FeatureSet. Diagnostic gates, default off:
+WINE_NO_SYSTEM_BIOS_DATE=1 skips the BIOS date, WINE_FEATURESET=<hex> overrides FeatureSet.
+---
+ programs/wineboot/wineboot.c | 16 +++++++++++++---
+ 1 file changed
+
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -701,7 +701,10 @@
+             fpu_key = 0;
+         break;
+     }
+-    set_reg_value( system_key, L"SystemBiosDate", L"01/01/70" );
++    /* WINE_NO_SYSTEM_BIOS_DATE=1: do not publish the constant 01/01/70 BIOS date, which
++     * Wine 10 did not write and which environment-detection code can read as an emulator. */
++    if (!GetEnvironmentVariableW( L"WINE_NO_SYSTEM_BIOS_DATE", NULL, 0 ))
++        set_reg_value( system_key, L"SystemBiosDate", L"01/01/70" );
+ 
+     if (RegCreateKeyExW( system_key, L"CentralProcessor", 0, NULL, REG_OPTION_VOLATILE,
+                          KEY_ALL_ACCESS, NULL, &cpu_key, NULL ))
+@@ -752,8 +755,15 @@
+                 DWORD tsc_freq_mhz = (DWORD)(tsc_frequency / 1000000ull); /* Hz -> Mhz */
+                 if (!tsc_freq_mhz) tsc_freq_mhz = power_info[core].MaxMhz;
+ 
+-                RegSetValueExW( hkey, L"FeatureSet", 0, REG_DWORD,
+-                                (BYTE *)&sci.ProcessorFeatureBits, sizeof(DWORD) );
++                {
++                    /* WINE_FEATURESET=<hex>: report this CentralProcessor FeatureSet instead of
++                     * the computed feature bits (diagnostic: Wine 10 reported a different value). */
++                    WCHAR fs_env[32];
++                    DWORD feature_set = sci.ProcessorFeatureBits;
++                    if (GetEnvironmentVariableW( L"WINE_FEATURESET", fs_env, ARRAY_SIZE(fs_env) ))
++                        feature_set = wcstoul( fs_env, NULL, 0 );
++                    RegSetValueExW( hkey, L"FeatureSet", 0, REG_DWORD, (BYTE *)&feature_set, sizeof(DWORD) );
++                }
+                 set_reg_value( hkey, L"Identifier", id );
+                 if (vendorid) set_reg_value( hkey, L"VendorIdentifier", vendorid );
+                 if (version) set_reg_value( hkey, L"ProcessorNameString", version );
+-- 
+2.43.0

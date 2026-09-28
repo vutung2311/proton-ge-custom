@@ -1,0 +1,72 @@
+From: Claude Opus 4.8 <noreply@anthropic.com>
+Date: Mon, 15 Sep 2026 00:00:00 +0000
+Subject: [PATCH] server: gate Proton 11 thread priority->nice mapping and
+ main-thread boost
+
+Proton 11 added a Windows-priority -> Linux-nice mapping in
+apply_thread_priority() together with a +1 main-thread priority boost in
+get_effective_thread_priority() (Valve commit 622da4759, "server: Boost
+main thread priority").
+
+For heavily multi-threaded async-streaming engines (Messiah / Where Winds
+Meet) this over-prioritises a small set of producer/coordinator threads
+(measured: ~10 game threads pulled from nice -5 to nice -8) relative to
+the ~150 nice-0 job-worker threads. The workers get starved, the
+producer/consumer pipeline runs out of phase, and the async loading
+scheduler re-dispatches ~2-3x more completion cycles, stretching world
+settle from ~15s (Proton 10) to ~50s.
+
+Add two runtime gates so the behaviour can be disabled per game without a
+rebuild:
+
+  WINE_DISABLE_MAIN_THREAD_BOOST=1  drop only the +1 main-thread boost
+  WINE_DISABLE_THREAD_NICE=1        disable the nice mapping entirely
+                                    (flat nice 0, Proton-10 scheduling)
+
+Both default off (unset) so no other title changes behaviour.
+
+Signed-off-by: Claude Opus 4.8 <noreply@anthropic.com>
+---
+diff --git a/server/thread.c b/server/thread.c
+index 5c4a6bd0..391a7deb 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -260,7 +260,17 @@ void init_threading(void)
+ static void apply_thread_priority( struct thread *thread )
+ {
+     int min = -nice_limit, max = nice_limit, range = max - min, niceness;
+-    int effective_priority = get_effective_thread_priority( thread );
++    int effective_priority;
++    static int no_nice = -1;
++
++    if (no_nice < 0)
++    {
++        const char *e = getenv( "WINE_DISABLE_THREAD_NICE" );
++        no_nice = (e && atoi( e )) ? 1 : 0;
++    }
++    if (no_nice) return;
++
++    effective_priority = get_effective_thread_priority( thread );
+ 
+     if (nice_limit >= 0) return;
+ 
+@@ -857,11 +867,18 @@ affinity_t get_thread_affinity( struct thread *thread )
+ int get_effective_thread_priority( struct thread *thread )
+ {
+     int priority = thread->priority;
++    static int no_boost = -1;
++
++    if (no_boost < 0)
++    {
++        const char *e = getenv( "WINE_DISABLE_MAIN_THREAD_BOOST" );
++        no_boost = (e && atoi( e )) ? 1 : 0;
++    }
+ 
+     if (thread->disable_boost || priority >= LOW_REALTIME_PRIORITY)
+         return priority;
+ 
+-    if (get_process_first_thread( thread->process ) == thread)
++    if (!no_boost && get_process_first_thread( thread->process ) == thread)
+         priority++;
+ 
+     return min( priority, LOW_REALTIME_PRIORITY - 1 );

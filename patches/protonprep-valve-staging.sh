@@ -13,6 +13,14 @@ apply_all_in_dir() {
     done
 }
 
+# PROTONPREP_WINE_ONLY=1: only patch the wine tree at ./wine, which the caller has
+# already extracted and to which it has already applied the e813ca57 revert. The
+# in-place submodule prep and every git reset/clean/checkout/revert are skipped, so
+# this mode is safe on a disposable shadow tree (see build_runner.sh).
+WINE_ONLY="${PROTONPREP_WINE_ONLY:-0}"
+
+if [ "$WINE_ONLY" != "1" ]; then
+
 ### (1) PREP SECTION ###
 
     # Wine-Mono is reset from its pinned release archive rather than a Git submodule.
@@ -90,9 +98,13 @@ apply_all_in_dir() {
     echo "LSTEAMCLIENT: apply Steam Input and initialization fixes"
     apply_all_in_dir "patches/lsteamclient"
 
+fi
+
 ### (2) WINE PATCHING ###
 
     pushd wine
+
+if [ "$WINE_ONLY" != "1" ]; then
     git reset --hard HEAD
     git clean -xdf
 
@@ -104,6 +116,7 @@ apply_all_in_dir() {
     git revert --no-commit e813ca5771658b00875924ab88d525322e50d39f
 
 ### END PROBLEMATIC COMMIT REVERT SECTION ###
+fi
 
 ### (2-2) EM-11/WINE-WAYLAND PATCH SECTION ###
 
@@ -481,6 +494,31 @@ apply_all_in_dir() {
 
     echo "WINE: expose native DualSense Edge as DualSense for Diablo IV"
     apply_patch "../patches/wine-hotfixes/pending/winebus-diablo-iv-dualsense-edge-identity.patch"
+
+### (2-8) CUSTOM RUNNER PATCHES ###
+
+    echo "WINE: -CUSTOM- ntdll: skip the zero-timeout completion-port pre-wait unless fsync is active"
+    apply_patch "../patches/wine-hotfixes/pending/0001-inproc-iocp-event-driven.patch"
+
+    echo "WINE: -CUSTOM- server: runtime gates for thread priority->nice mapping and main-thread boost"
+    apply_patch "../patches/wine-hotfixes/pending/0002-server-gate-thread-priority-nice-and-boost.patch"
+
+    echo "WINE: -CUSTOM- winepulse: retry a failed stream connect with default attributes"
+    apply_patch "../patches/wine-hotfixes/pending/0003-winepulse-fallback-connect.patch"
+
+    echo "WINE: -CUSTOM- ntdll: WINE_HIDE_CPU_FEATURES env gate for IsProcessorFeaturePresent"
+    apply_patch "../patches/wine-hotfixes/pending/0004-ntdll-hide-cpu-features-env.patch"
+
+    echo "WINE: -CUSTOM- wineboot: env gates for SystemBiosDate and CentralProcessor FeatureSet"
+    apply_patch "../patches/wine-hotfixes/pending/0005-wineboot-env-gates-bios-date-featureset.patch"
+
+    echo "WINE: -CUSTOM- mountmgr.sys: report StorageDeviceTrimProperty (TrimEnabled) as GE-Proton10 did"
+    apply_patch "../patches/wine-hotfixes/pending/0006-mountmgr-report-storage-trim-property.patch"
+
+    echo "WINE: -CUSTOM- ntdll: LTO build"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-lto-build.patch"
+
+### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

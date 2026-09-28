@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Antigravity <antigravity@google.com>
+Date: Sun, 6 Sep 2026 11:15:00 +0700
+Subject: [PATCH] vkd3d: add streaming allocator and pipeline cache quirks for wwm.exe
+
+Where Winds Meet (wwm.exe) benefits from bypassing host/device memory zeroing
+during heavy level streaming, ignoring mismatched Windows-driver signatures in
+application CachedPSO blobs, recycling command pools, and enforcing the global
+persistent pipeline cache stream archive.
+---
+ libs/vkd3d/device_workarounds.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/libs/vkd3d/device_workarounds.c b/libs/vkd3d/device_workarounds.c
+--- a/libs/vkd3d/device_workarounds.c
++++ b/libs/vkd3d/device_workarounds.c
+@@ -83,6 +83,19 @@
+             VKD3D_CONFIG_FLAG_INIT_STATIC(
+                 .MEMORY_ALLOCATOR_SKIP_CLEAR = 1, .PIPELINE_LIBRARY_IGNORE_MISMATCH_DRIVER = 1,
+                 .RECYCLE_COMMAND_POOLS = 1), VKD3D_CONFIG_FLAGS_NONE, VKD3D_APPLICATION_FEATURE_REQUIRES_MIN16_DENORMS },
++    /* Where Winds Meet (wwm.exe).
++     * Skip memory zeroing during heavy level streaming, tolerate mismatched
++     * driver signatures in application CachedPSO blobs without logging or errors,
++     * recycle command pools to avoid allocator churn, and enforce the global
++     * pipeline cache stream archive. */
++    { VKD3D_STRING_COMPARE_EXACT, "wwm.exe",
++            VKD3D_CONFIG_FLAG_INIT_STATIC(
++                .MEMORY_ALLOCATOR_SKIP_CLEAR = 1,
++                .MEMORY_ALLOCATOR_SKIP_IMAGE_HEAP_CLEAR = 1,
++                .PIPELINE_LIBRARY_IGNORE_MISMATCH_DRIVER = 1,
++                .RECYCLE_COMMAND_POOLS = 1,
++                .GLOBAL_PIPELINE_CACHE = 1,
++                .NO_STAGGERED_SUBMIT = 1) },
+     /* Serious Sam 4 (257420).
+      * Invariant workarounds cause graphical glitches when rendering foliage on NV. */
+     { VKD3D_STRING_COMPARE_EXACT, "Sam4.exe",
+-- 
+2.43.0

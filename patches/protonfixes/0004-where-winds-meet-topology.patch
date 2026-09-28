@@ -1,0 +1,53 @@
+From: Open-Wine-Components <fixes@proton-ge-custom>
+Date: Wed, 16 Sep 2026 18:00:00 +0700
+Subject: [PATCH] gamefixes-steam: Add CPU topology clamp for Where Winds Meet (3564740, 3804320)
+
+Where Winds Meet spawns worker threads matching logical CPU count.
+On SMT-enabled high-core CPUs, spawning 13+ concurrent worker threads
+oversaturates physical cores and causes high involuntary preemptions.
+Clamping CPU topology to physical cores (no SMT) reduces workers to 6.
+---
+ gamefixes-steam/3564740.py | 12 ++++++++++++
+ gamefixes-steam/3804320.py | 12 ++++++++++++
+ 2 files changed, 24 insertions(+)
+ create mode 100644 gamefixes-steam/3564740.py
+ create mode 100644 gamefixes-steam/3804320.py
+
+diff --git a/gamefixes-steam/3564740.py b/gamefixes-steam/3564740.py
+new file mode 100644
+index 0000000..c78ba04
+--- /dev/null
++++ b/gamefixes-steam/3564740.py
+@@ -0,0 +1,12 @@
++"""Game fix for Where Winds Meet"""
++
++from protonfixes import util
++
++
++def main() -> None:
++    """Where Winds Meet / Messiah Engine creates worker threads matching logical CPU count.
++    On multi-threaded CPUs (e.g. 8c/16t Ryzen 9800X3D), spawning 13+ concurrent worker threads
++    oversaturates physical cores and causes high involuntary preemption and long loading stalls.
++    Clamping CPU topology to physical cores (no SMT) reduces workers to 6 and matches P10-34.
++    """
++    util.set_cpu_topology_nosmt(core_limit=8)
+diff --git a/gamefixes-steam/3804320.py b/gamefixes-steam/3804320.py
+new file mode 100644
+index 0000000..ef71412
+--- /dev/null
++++ b/gamefixes-steam/3804320.py
+@@ -0,0 +1,12 @@
++"""Game fix for Where Winds Meet Playtest"""
++
++from protonfixes import util
++
++
++def main() -> None:
++    """Where Winds Meet / Messiah Engine creates worker threads matching logical CPU count.
++    On multi-threaded CPUs (e.g. 8c/16t Ryzen 9800X3D), spawning 13+ concurrent worker threads
++    oversaturates physical cores and causes high involuntary preemption and long loading stalls.
++    Clamping CPU topology to physical cores (no SMT) reduces workers to 6 and matches P10-34.
++    """
++    util.set_cpu_topology_nosmt(core_limit=8)
+-- 
+2.48.1

@@ -1,0 +1,61 @@
+From: XProtocol Bot
+Subject: [PATCH] mountmgr.sys: Report StorageDeviceTrimProperty (TrimEnabled).
+
+GE-Proton10 answered IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceTrimProperty) with TrimEnabled=1;
+Wine 11 returns STATUS_NOT_SUPPORTED. Where Winds Meet issues storage property queries during the
+teleport load, which is ~35 s slower on Wine 11; this restores the GE-Proton10 answer.
+---
+--- a/dlls/mountmgr.sys/device.c	2026-09-28 17:17:30.784555468 +0700
++++ b/dlls/mountmgr.sys/device.c	2026-09-28 17:17:54.020056551 +0700
+@@ -1619,6 +1619,36 @@
+         }
+         break;
+     }
++    case StorageDeviceTrimProperty:
++    {
++        DEVICE_TRIM_DESCRIPTOR *d = irp->AssociatedIrp.SystemBuffer;
++
++        if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(STORAGE_DESCRIPTOR_HEADER))
++        {
++            status = STATUS_INVALID_PARAMETER;
++        }
++        else
++        {
++            if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*d))
++            {
++                d->Version = d->Size = sizeof(*d);
++                irp->IoStatus.Information = sizeof(STORAGE_DESCRIPTOR_HEADER);
++            }
++            else
++            {
++                /* Report TRIM, consistent with the seek-penalty stub above reporting a disk without
++                 * seek penalty; applications combine both to detect solid-state storage. */
++                FIXME( "Faking StorageDeviceTrimProperty data.\n" );
++
++                memset( d, 0, sizeof(*d) );
++                d->Version = d->Size = sizeof(*d);
++                d->TrimEnabled = TRUE;
++                irp->IoStatus.Information = sizeof(*d);
++            }
++            status = STATUS_SUCCESS;
++        }
++        break;
++    }
+ 
+     default:
+         FIXME( "Unsupported property %#x\n", query->PropertyId );
+--- a/include/ntddstor.h	2026-09-28 17:19:28.867859425 +0700
++++ b/include/ntddstor.h	2026-09-28 17:19:28.873857017 +0700
+@@ -266,6 +266,12 @@
+     BOOLEAN                     IncursSeekPenalty;
+ } DEVICE_SEEK_PENALTY_DESCRIPTOR, *PDEVICE_SEEK_PENALTY_DESCRIPTOR;
+ 
++typedef struct _DEVICE_TRIM_DESCRIPTOR {
++    DWORD                       Version;
++    DWORD                       Size;
++    BOOLEAN                     TrimEnabled;
++} DEVICE_TRIM_DESCRIPTOR, *PDEVICE_TRIM_DESCRIPTOR;
++
+ typedef struct _STORAGE_DESCRIPTOR_HEADER {
+     ULONG                       Version;
+     ULONG                       Size;

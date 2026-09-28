@@ -1,0 +1,32 @@
+diff --git a/fix.py b/fix.py
+index df22d03..f687d9e 100644
+--- a/fix.py
++++ b/fix.py
+@@ -18,17 +18,21 @@ from .logger import log
+ @lru_cache
+ def get_game_id() -> str:
+     """Trys to return the game id from environment variables"""
+-    if 'UMU_ID' in os.environ:
++    if 'UMU_ID' in os.environ and os.environ['UMU_ID']:
+         return os.environ['UMU_ID']
+-    if 'SteamAppId' in os.environ:
++    if 'SteamAppId' in os.environ and os.environ['SteamAppId']:
+         return os.environ['SteamAppId']
+-    if 'SteamGameId' in os.environ:
++    if 'SteamGameId' in os.environ and os.environ['SteamGameId']:
+         return os.environ['SteamGameId']
++    if 'GAMEID' in os.environ and os.environ['GAMEID']:
++        return os.environ['GAMEID']
+     if 'STEAM_COMPAT_DATA_PATH' in os.environ:
+-        return re.findall(r'\d+', os.environ['STEAM_COMPAT_DATA_PATH'])[-1]
++        digits = re.findall(r'\d+', os.environ['STEAM_COMPAT_DATA_PATH'])
++        if digits:
++            return digits[-1]
+ 
+-    log.crit('Game ID not found in environment variables')
+-    exit()
++    log.warn('Game ID not found in environment variables, defaulting to generic')
++    return 'default'
+ 
+ 
+ def get_game_title(database: str) -> str:
