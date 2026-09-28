@@ -8,6 +8,11 @@
   (`patches/wine-hotfixes/pending/0006-mountmgr-report-storage-trim-property.patch`) and changing only
   `mountmgr.sys` in the custom Wine 11 runner: **world HUD at 11.6 / 11.7 s, upload pause 2.4 / 2.8 s** in two runs (unpatched
   Wine 11: 46.5-47.8 s and 36-38 s in every run; GE-Proton10-34: 11.2-12.3 s, 2.1-2.9 s).
+- **Steady-state cost (2026-09-28, §37).** With the load fixed, completion-port IPC was the largest
+  remaining Wine overhead (12.9 M operations per session, ~3 µs each through wineserver).
+  `0007-ntdll-in-process-completion-ports.patch` (replaces the old `0001`) serves the game's own ports
+  in-process: **total CPU 3.11 → 2.60 cores, wineserver 0.29 → 0.04 cores, game context switches
+  ~190 k/s → ~37 k/s**, with unchanged load time (13.7 / 13.8 s) and frame pacing (100 fps cap).
 - **The core problem, measured end to end.** A teleport load (Enter pressed at teleport start → Enter pressed when the loading overlay is gone and the world renders) takes **8.9–18.0 s on GE-Proton10-34** and **47.0–64.4 s on every GE-Proton 11 build tested** (Valve-based custom, GE-based custom). Same Lutris environment, same prefix, same machine, no memory pressure. Full run table in §34.1.
 - **The regression is not in d3d12/vkd3d-proton, not in the job system and not in the completion-port layer.** vkd3d-proton's own queue timeline (§34.4) shows the renderer running *faster* on 11, uploads executing in the same 115 µs, and no pipeline compiles. The job system's IOCP task rate per second is the same on 10 and 11 (§34.3); its larger totals on 11 only reflect a longer load.
 - **Superseded lead (see §36): a lost wakeup in the asset-streaming path.** On GE-Proton 11 the streamer submits one GPU upload per timer tick on a strict **+600.1 ms / +999.9 ms** cadence (±0.1 ms) for ~36 s between two upload bursts. GE-Proton10-34 shows no such cadence. The streaming thread therefore only advances when a 600 ms or 1000 ms timed wait expires; the signal that should end those waits early does not arrive. Which wait primitive loses the wake is the open question (§34.6).
@@ -3468,3 +3473,69 @@ both runtimes (the game was never slower per unit of work, it was doing less per
 The wait/wake, completion, timer, CPU-feature, topology, memory and identity experiments were correctly
 negative.
 
+
+## 37. In-Process Completion Ports (patch 0007) Replace the Old 0001 (2026-09-28)
+
+**Why.** With the TRIM fix (§36) the load gap is gone, so the remaining Wine 11 cost is steady-state
+IPC. A per-operation benchmark (`iocp_cost.c`: one post + one dequeue on an unbound port) on
+GE-Proton11-custom took **3.07 µs** per operation, of which ~0.4 µs was user-space code (ntdll + wineserver)
+and ~3.4 µs CPU was kernel (request/reply and thread switches). LTO or better data structures could
+only touch the user-space share (ntdll.so is already LTO-built; a wineserver LTO build would save
+<1%). A census of the game's ports (`scratch/gen_iocp_purity.sh`, `scratch/iocp_purity_report.py`)
+counted 12.9 M completion-port operations per session (`NtSetIoCompletion` 6.2 M, `NtRemoveIoCompletion`
+6.6 M, never the Ex/query variants), ~99% on ports that only the game's own threads use. The
+duplications seen at t+46 s name the same handle *values* in three other processes (anti-cheat/
+reporter reading foreign handles), not the game's ports; the 1.76 M direct waits are Wine's own
+zero-timeout pre-check in `NtRemoveIoCompletion`.
+
+**Design** (`patches/wine-hotfixes/pending/0007-ntdll-in-process-completion-ports.patch`,
+new `dlls/ntdll/unix/iocp.c` plus hooks; applied last in the CUSTOM block; the old
+`0001-inproc-iocp-event-driven.patch` is removed). An unnamed, non-inheritable port created with
+query+modify access keeps its queue in the process; the server object always exists. The first use
+only the server can serve demotes it for good, handing queued packets to the server in order: file or
+socket bound, job object associated, handle duplicated *out of this process* (source process checked
+by process id, so foreign handle values do not demote), handle flags changed, `NtSetIoCompletionEx`,
+alertable dequeue, direct wait on the handle. Waiters sleep on a per-port futex with signals
+unblocked (system APCs and suspension reach them as in any non-server wait); close wakes them with
+`STATUS_ABANDONED_WAIT_0` as the server does; a waiter whose port is demoted mid-wait continues on the
+server with the remaining timeout. Handles are compared with the two low bits cleared. Locking: a
+writer-preferring table rwlock (lookups read, register/demote/close write) then an adaptive per-port
+mutex; the table uses fixed slots so the lock-free pre-check never misses a live port.
+`WINE_INPROC_IOCP=0` disables it; `WINEDEBUG=+iocp` logs registrations, demotions (with reason and
+traffic served) and closes.
+
+**Benchmarks (outside the game).** `iocp_cost.c`: post+dequeue 3,070 → **149 ns**, two-thread hand-off
+2,473 → **795 ns**, wineserver CPU ~2 µs → ~0 per operation. IOCP suite, stock → in-process: test 5
+(8P/8C) 0.52 → 0.81 M ops/s, test 12 0.25 → 0.63 M ops/s, test 21 41.95 → 28.67 µs/wave, test 25
+8.77 → 3.09 µs/hand-off, test 31 15,687 → 20,270 waves/s, test 34 12,001 → 18,240 waves/s. The first
+version (global mutex + plain port mutex) made tests 5 and 12 15-20% *slower* than the server; the
+rwlock and adaptive mutex fixed that. The same three tests fail on both runners (7: NULL output
+pointers, 26: zero-delay yield status, 27: worker spread on a server-served bound port). New test 35
+(direct wait with queued packets, `h|1` alias, close while waiting, file bound mid-wait keeps the
+deadline, queue depth) passes on both, and `+iocp` shows each case going through the in-process path.
+
+**In the game** (`scratch/wwm_ab_run.sh p11ce11` vs `p11ciocp`, `AUTO=1 NOPROFILE=1`, alternating;
+CPU from `scratch/wwm_cpu.py`, window world+5..+80 s):
+
+| | GE-Proton11-custom | + 0007 |
+| :--- | :--- | :--- |
+| Total CPU (game + wineserver) | 3.02-3.24 cores (mean 3.11, 4 runs) | **2.56-2.64 cores (mean 2.60, 6 runs)** |
+| wineserver CPU | 0.27-0.31 cores | **0.03-0.07 cores** |
+| Game context switches | 178-197 k/s | **32-44 k/s** |
+| Teleport → world on screen | 13.3-15.0 s (mean 13.7, 6 runs) | 13.0-14.6 s (mean 13.8, 7 runs) |
+| p99 frame time (100 fps cap) | 11.05-11.39 ms | 11.07-11.20 ms |
+| Frames > 18 ms per 10 k | 2.2 | 1.9 |
+| Worst frame per run | 14.4-69.5 ms (mean 26.9) | 14.1-30.0 ms (mean 22.8; rank test p = 0.37) |
+
+A `+iocp` run showed all 74 port events (47 registrations, 15 demotions, 12 closes) during login,
+24-55 s before the world appears; none in the world. The occasional 20-30 ms frames occur on both
+runners and coincide with no port event, no CPU or context-switch burst and no game-log line.
+Result: half a core less CPU and ~150 k fewer context switches per second at equal load time and
+frame pacing; at the 100 fps cap this is headroom, not fps.
+
+**Measurement notes.** Load times here use the corrected screen rule (world = first frame after
+the last loading-bar frame, confirmed by the HUD within 5 s; loading only from the progress-bar
+region, because the bottom band's player id / FPS overlay OCRs into stray "N %"), measured from
+`gamelog:on_become_player`. `PROTONLOG=1` runs set Lutris `show_debug: inherit`, otherwise Lutris
+forces `WINEDEBUG=-all`. A running Lutris caches its Proton list at startup; the harness now refuses
+runners newer than the Lutris process instead of letting the game start under Lutris's default Proton.

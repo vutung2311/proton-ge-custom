@@ -497,9 +497,6 @@ fi
 
 ### (2-8) CUSTOM RUNNER PATCHES ###
 
-    echo "WINE: -CUSTOM- ntdll: skip the zero-timeout completion-port pre-wait unless fsync is active"
-    apply_patch "../patches/wine-hotfixes/pending/0001-inproc-iocp-event-driven.patch"
-
     echo "WINE: -CUSTOM- server: runtime gates for thread priority->nice mapping and main-thread boost"
     apply_patch "../patches/wine-hotfixes/pending/0002-server-gate-thread-priority-nice-and-boost.patch"
 
@@ -517,6 +514,9 @@ fi
 
     echo "WINE: -CUSTOM- ntdll: LTO build"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-lto-build.patch"
+
+    echo "WINE: -CUSTOM- ntdll: serve same-process completion-port traffic in-process"
+    apply_patch "../patches/wine-hotfixes/pending/0007-ntdll-in-process-completion-ports.patch"
 
 ### END CUSTOM RUNNER PATCHES ###
 
