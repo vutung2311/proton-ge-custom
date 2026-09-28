@@ -1,0 +1,15 @@
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index 38c865b..5612c54 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -4,8 +4,8 @@ UNIXLIB   = ntdll.so
+ IMPORTLIB = ntdll
+ IMPORTS   = $(TOMCRYPT_PE_LIBS) $(MUSL_PE_LIBS)
+ EXTRAINCL = $(TOMCRYPT_PE_CFLAGS)
+-UNIX_CFLAGS  = $(UNWIND_CFLAGS) $(HWLOC_CFLAGS)
+-UNIX_LIBS    = $(IOKIT_LIBS) $(COREFOUNDATION_LIBS) $(CORESERVICES_LIBS) $(RT_LIBS) $(PTHREAD_LIBS) $(UNWIND_LIBS) $(I386_LIBS) $(PROCSTAT_LIBS) $(HWLOC_LIBS)
++UNIX_CFLAGS  = $(UNWIND_CFLAGS) $(HWLOC_CFLAGS) -flto=auto
++UNIX_LIBS    = $(IOKIT_LIBS) $(COREFOUNDATION_LIBS) $(CORESERVICES_LIBS) $(RT_LIBS) $(PTHREAD_LIBS) $(UNWIND_LIBS) $(I386_LIBS) $(PROCSTAT_LIBS) $(HWLOC_LIBS) -flto=auto -Wl,-u,trace_syscall -Wl,-u,trace_sysret -Wl,-u,init_syscall_frame -Wl,-u,trace_usercall -Wl,-u,trace_userret
+ 
+ EXTRADLLFLAGS = -nodefaultlibs
+ i386_EXTRADLLFLAGS = -Wl,--image-base,0x7bc00000

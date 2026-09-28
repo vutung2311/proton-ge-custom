@@ -1,0 +1,439 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Antigravity <antigravity@google.com>
+Date: Sun, 6 Sep 2026 22:30:00 +0700
+Subject: [PATCH] vkd3d: pipeline cache overwrite and persist across builds
+
+Implement cache overwrite in vkd3d_pipeline_library_disk_cache_merge:
+- Populate write_map with incoming write-cache entries.
+- Re-serialize a fresh stream archive header for the active build.
+- Copy existing read-cache entries while skipping entries that have newer
+  equivalents in the write cache.
+- Append incoming write entries to overwrite old entries and deduplicate.
+- Atomically replace the read cache with the merged cache via temporary file.
+- Prevent stream archives from discarding valid pre-compiled blobs on transient
+  build/commit bumps when hardware/driver UUID and shader interface match.
+- Ensure transactional rollback and promote write cache when read cache is invalid.
+---
+diff --git a/libs/vkd3d/cache.c b/libs/vkd3d/cache.c
+index 14a5755..f30d57a 100644
+--- a/libs/vkd3d/cache.c
++++ b/libs/vkd3d/cache.c
+@@ -381,24 +381,28 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+      * and the driver since that will affect the generated pipeline cache.
+      * Based on global configuration flags, which extensions are available, etc,
+      * the generated shaders may also change, so key on that as well. */
+-    if (blob->vkd3d_build != vkd3d_build ||
+-            blob->vkd3d_shader_interface_key != device->shader_interface_key)
++    if (blob->vkd3d_shader_interface_key != device->shader_interface_key)
+     {
+         if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
++            INFO("Unexpected shader interface key (got %"PRIx64", expected %"PRIx64"), returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n",
++                    blob->vkd3d_shader_interface_key, device->shader_interface_key);
++        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
++    }
++
++    if (blob->vkd3d_build != vkd3d_build)
++    {
++        if (pipeline_library_flags & VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE)
+         {
+-            if (blob->vkd3d_build != vkd3d_build)
+-            {
++            /* Stream archive disk cache blobs are validated at the stream header level.
++             * Accept valid cached blobs on transient build bumps when shader interface and driver UUID match. */
++        }
++        else
++        {
++            if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
+                 INFO("Unexpected build version (got %"PRIx64", expected %"PRIx64"), returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n",
+                         blob->vkd3d_build, vkd3d_build);
+-            }
+-
+-            if (blob->vkd3d_shader_interface_key != device->shader_interface_key)
+-            {
+-                INFO("Unexpected shader interface key (got %"PRIx64", expected %"PRIx64"), returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n",
+-                        blob->vkd3d_shader_interface_key, device->shader_interface_key);
+-            }
++            return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+         }
+-        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+     }
+ 
+     /* Only verify pipeline cache UUID if we're going to read anything from it. */
+@@ -2223,11 +2227,21 @@ static HRESULT d3d12_pipeline_library_validate_stream_format_header(struct d3d12
+     if (header->device_id != device_properties->deviceID || header->vendor_id != device_properties->vendorID)
+         return D3D12_ERROR_ADAPTER_NOT_FOUND;
+ 
+-    if (header->vkd3d_build != vkd3d_build)
++    if (header->vkd3d_shader_interface_key != device->shader_interface_key)
+         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+ 
+-    if (header->vkd3d_shader_interface_key != device->shader_interface_key)
++    if (pipeline_library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE)
++    {
++        if (header->vkd3d_build != vkd3d_build && VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
++        {
++            INFO("vkd3d build mismatch (0x%"PRIx64" vs 0x%"PRIx64"), but hardware/driver UUID match. Accepting cache.\n",
++                    header->vkd3d_build, vkd3d_build);
++        }
++    }
++    else if (header->vkd3d_build != vkd3d_build)
++    {
+         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
++    }
+ 
+     /* If we never store pipeline caches, we don't have to care about pipeline cache UUID. */
+     if (pipeline_library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_USE_PIPELINE_CACHE_UUID)
+@@ -2946,22 +2960,27 @@ static void vkd3d_pipeline_library_disk_cache_merge(struct vkd3d_pipeline_librar
+     struct vkd3d_serialized_pipeline_library_stream header;
+     struct vkd3d_memory_mapped_file mapped_write_cache;
+     char merge_path[VKD3D_PATH_MAX];
+-    unsigned int existing_entries;
++    char new_path[VKD3D_PATH_MAX];
++    unsigned int existing_entries = 0;
++    unsigned int new_entries = 0;
+     struct disk_cache_entry entry;
+     uint8_t *tmp_buffer = NULL;
+     size_t tmp_buffer_size = 0;
+-    unsigned int new_entries;
+     size_t write_cache_size;
+-    struct hash_map map;
++    struct hash_map write_map;
++    struct hash_map merged_map;
++    bool cancellation = false;
++    bool write_failed = false;
+     size_t aligned_size;
+-    FILE *merge_file;
+-    int64_t off;
++    FILE *merge_file = NULL;
++    FILE *new_file = NULL;
+     HRESULT hr;
+ 
+     memset(&mapped_write_cache, 0, sizeof(mapped_write_cache));
+     snprintf(merge_path, sizeof(merge_path), "%s.merge", read_path);
+-    hash_map_init(&map, disk_cache_entry_key_cb, disk_cache_entry_compare_cb, sizeof(struct disk_cache_entry));
+-    merge_file = NULL;
++    snprintf(new_path, sizeof(new_path), "%s.new", read_path);
++    hash_map_init(&write_map, disk_cache_entry_key_cb, disk_cache_entry_compare_cb, sizeof(struct disk_cache_entry));
++    hash_map_init(&merged_map, disk_cache_entry_key_cb, disk_cache_entry_compare_cb, sizeof(struct disk_cache_entry));
+ 
+     /* If we only have a write-only cache, but no read-only one, this will succeed.
+      * We're done. */
+@@ -2994,7 +3013,7 @@ static void vkd3d_pipeline_library_disk_cache_merge(struct vkd3d_pipeline_librar
+     if (vkd3d_file_rename_no_replace(read_path, merge_path))
+     {
+         INFO("Merging disk caches.\n");
+-        merge_file = fopen(merge_path, "rb+");
++        merge_file = fopen(merge_path, "rb");
+ 
+         /* Shouldn't happen, but can happen if another process races us and deletes the merge file
+          * in the interim. */
+@@ -3004,54 +3023,91 @@ static void vkd3d_pipeline_library_disk_cache_merge(struct vkd3d_pipeline_librar
+             goto out;
+         }
+ 
+-        existing_entries = 0;
+-        new_entries = 0;
+-
+-        /* If we have a read-only cache, atomically move to the merge path.
+-         * If we win, the merge-only file is "owned" by this thread, and we consider it safe to append to it.
+-         * Here, we will open the file in append mode, seek to the last whole blob entry,
+-         * and then append the write-only portion. */
+-
++        /* If we have a read-only cache, atomically moved to the merge path.
++         * If the read-only cache is completely incompatible with the adapter/driver,
++         * promote write cache to read cache. */
+         if (fread(&header, sizeof(header), 1, merge_file) != 1 ||
+                 FAILED(hr = d3d12_pipeline_library_validate_stream_format_header(cache->library,
+                         cache->library->device, &header, sizeof(header))))
+         {
+             INFO("Read-only cache is out of date, discarding it.\n");
+-            /* Just promote the write cache to read cache and call it a day. */
+             fclose(merge_file);
+             merge_file = NULL;
+             vkd3d_file_delete(merge_path);
++            vkd3d_file_unmap(&mapped_write_cache);
+             if (vkd3d_file_rename_overwrite(write_path, read_path))
+                 INFO("Successfully promoted write cache to read cache.\n");
++            goto out;
+         }
+         else
+         {
+-            /* Find the end of the read cache which contains whole and sane entries.
+-             * At the same time, add entries to the hash map, so that we don't insert duplicates. */
+-            off = _ftelli64(merge_file);
++            /* 1. Build write_map with all valid entries in write cache */
++            write_cache_header = mapped_write_cache.mapped;
++            write_cache_size = mapped_write_cache.mapped_size;
++            write_entries = (const struct vkd3d_serialized_pipeline_stream_entry *)write_cache_header->entries;
++            write_cache_size -= sizeof(*write_cache_header);
++
++            while (write_cache_size >= sizeof(*write_entries))
++            {
++                write_cache_size -= sizeof(*write_entries);
++                aligned_size = align(write_entries->size, VKD3D_PIPELINE_BLOB_ALIGN);
++
++                if (write_cache_size < aligned_size)
++                    break;
++
++                if (vkd3d_serialized_pipeline_stream_entry_validate(write_entries->data, write_entries))
++                {
++                    entry.key.hash = write_entries->hash;
++                    entry.key.type = write_entries->type;
++                    if (!hash_map_find(&write_map, &entry.key))
++                    {
++                        if (!hash_map_insert(&write_map, &entry.key, &entry.entry))
++                        {
++                            write_failed = true;
++                            break;
++                        }
++                    }
++                }
++
++                write_cache_size -= aligned_size;
++                write_entries = (const struct vkd3d_serialized_pipeline_stream_entry *)&write_entries->data[aligned_size];
++            }
+ 
+-            /* From a cold disk cache, this can be quite slow. Poll the teardown atomic. */
+-            while (fread(&stream_entry, sizeof(stream_entry), 1, merge_file) == 1)
++            /* 2. Open new_file and write freshly serialized stream header matching current build */
++            if (!write_failed)
++            {
++                new_file = fopen(new_path, "wb");
++                if (!new_file)
++                {
++                    INFO("Cannot create new merge cache file, restoring read cache.\n");
++                    write_failed = true;
++                }
++                else
++                {
++                    d3d12_pipeline_library_serialize_stream_archive_header(cache->library, &header);
++                    if (fwrite(&header, sizeof(header), 1, new_file) != 1)
++                        write_failed = true;
++                }
++            }
++
++            /* 3. Read and copy existing entries from merge_file, skipping keys present in write_map */
++            while (!write_failed && fread(&stream_entry, sizeof(stream_entry), 1, merge_file) == 1)
+             {
+-                /* Don't want to throw away the disk caches here. Try again next time. */
+                 if (vkd3d_atomic_uint32_load_explicit(&cache->library->stream_archive_cancellation_point,
+                         vkd3d_memory_order_relaxed))
+                 {
+                     INFO("Device teardown request received, stopping parse early.\n");
+-                    /* Move the file back, don't delete anything. */
+-                    fclose(merge_file);
+-                    merge_file = NULL;
+-                    vkd3d_file_rename_overwrite(merge_path, read_path);
+-                    goto out_cancellation;
++                    cancellation = true;
++                    break;
+                 }
+ 
+                 aligned_size = align(stream_entry.size, VKD3D_PIPELINE_BLOB_ALIGN);
+ 
+-                /* Before accepting this as a valid entry, ensure checksums are correct.
+-                 * Ideally we'd have mmap going here, but appending while mmaping a file is ... dubious :) */
+-                if (!vkd3d_array_reserve((void**)&tmp_buffer, &tmp_buffer_size,
+-                        aligned_size, 1))
++                if (!vkd3d_array_reserve((void**)&tmp_buffer, &tmp_buffer_size, aligned_size, 1))
++                {
++                    write_failed = true;
+                     break;
++                }
+ 
+                 if (fread(tmp_buffer, 1, aligned_size, merge_file) != aligned_size)
+                 {
+@@ -3067,75 +3123,118 @@ static void vkd3d_pipeline_library_disk_cache_merge(struct vkd3d_pipeline_librar
+ 
+                 entry.key.hash = stream_entry.hash;
+                 entry.key.type = stream_entry.type;
+-                if (!hash_map_find(&map, &entry.key) && hash_map_insert(&map, &entry.key, &entry.entry))
+-                    existing_entries++;
+-                off = _ftelli64(merge_file);
++
++                /* If newer entry exists in write cache, skip older entry (overwritten) */
++                if (hash_map_find(&write_map, &entry.key))
++                    continue;
++
++                /* Avoid duplicate entries if archive previously had duplicates */
++                if (hash_map_find(&merged_map, &entry.key))
++                    continue;
++
++                if (fwrite(&stream_entry, sizeof(stream_entry), 1, new_file) != 1 ||
++                        fwrite(tmp_buffer, 1, aligned_size, new_file) != aligned_size)
++                {
++                    ERR("Failed to copy existing blob to new cache.\n");
++                    write_failed = true;
++                    break;
++                }
++
++                if (!hash_map_insert(&merged_map, &entry.key, &entry.entry))
++                {
++                    write_failed = true;
++                    break;
++                }
++                existing_entries++;
+             }
+ 
+-            if (_fseeki64(merge_file, off, SEEK_SET) == 0)
++            /* 4. Append all entries from write_cache into new_file */
++            write_cache_header = mapped_write_cache.mapped;
++            write_cache_size = mapped_write_cache.mapped_size;
++            write_entries = (const struct vkd3d_serialized_pipeline_stream_entry *)write_cache_header->entries;
++            write_cache_size -= sizeof(*write_cache_header);
++
++            while (!write_failed && !cancellation && write_cache_size >= sizeof(*write_entries))
+             {
+-                /* Merge entries. */
+-                write_cache_header = mapped_write_cache.mapped;
+-                write_cache_size = mapped_write_cache.mapped_size;
+-                write_entries = (const struct vkd3d_serialized_pipeline_stream_entry *)write_cache_header->entries;
+-                write_cache_size -= sizeof(*write_cache_header);
++                if (vkd3d_atomic_uint32_load_explicit(&cache->library->stream_archive_cancellation_point,
++                        vkd3d_memory_order_relaxed))
++                {
++                    INFO("Device teardown request received, stopping parse early.\n");
++                    cancellation = true;
++                    break;
++                }
++
++                write_cache_size -= sizeof(*write_entries);
++                aligned_size = align(write_entries->size, VKD3D_PIPELINE_BLOB_ALIGN);
+ 
+-                while (write_cache_size >= sizeof(*write_entries))
++                if (write_cache_size < aligned_size)
+                 {
+-                    /* Don't want to throw away the disk caches here. Try again next time. */
+-                    if (vkd3d_atomic_uint32_load_explicit(&cache->library->stream_archive_cancellation_point,
+-                            vkd3d_memory_order_relaxed))
+-                    {
+-                        INFO("Device teardown request received, stopping parse early.\n");
+-                        /* Move the file back, don't delete anything. */
+-                        fclose(merge_file);
+-                        merge_file = NULL;
+-                        vkd3d_file_rename_overwrite(merge_path, read_path);
+-                        goto out_cancellation;
+-                    }
++                    INFO("Write-only archive entry is sliced. Ignoring rest of archive.\n");
++                    break;
++                }
++
++                if (!vkd3d_serialized_pipeline_stream_entry_validate(write_entries->data, write_entries))
++                {
++                    INFO("Found corrupt entry in write-only archive. Ignoring rest of archive.\n");
++                    break;
++                }
+ 
+-                    write_cache_size -= sizeof(*write_entries);
+-                    aligned_size = align(write_entries->size, VKD3D_PIPELINE_BLOB_ALIGN);
++                entry.key.hash = write_entries->hash;
++                entry.key.type = write_entries->type;
+ 
+-                    if (write_cache_size < aligned_size)
++                if (!hash_map_find(&merged_map, &entry.key))
++                {
++                    if (fwrite(write_entries, sizeof(*write_entries), 1, new_file) != 1 ||
++                            fwrite(write_entries->data, 1, aligned_size, new_file) != aligned_size)
+                     {
+-                        INFO("Write-only archive entry is sliced. Ignoring rest of archive.\n");
++                        ERR("Failed to append blob to new cache.\n");
++                        write_failed = true;
+                         break;
+                     }
+ 
+-                    if (!vkd3d_serialized_pipeline_stream_entry_validate(write_entries->data, write_entries))
++                    if (!hash_map_insert(&merged_map, &entry.key, &entry.entry))
+                     {
+-                        INFO("Found corrupt entry in write-only archive. Ignoring rest of archive.\n");
++                        write_failed = true;
+                         break;
+                     }
++                    new_entries++;
++                }
+ 
+-                    entry.key.hash = write_entries->hash;
+-                    entry.key.type = write_entries->type;
+-                    if (!hash_map_find(&map, &entry.key) && hash_map_insert(&map, &entry.key, &entry.entry))
+-                    {
+-                        if (fwrite(write_entries, sizeof(*write_entries), 1, merge_file) != 1 ||
+-                                fwrite(write_entries->data, 1, aligned_size, merge_file) != aligned_size)
+-                        {
+-                            ERR("Failed to append blob to read-cache.\n");
+-                            break;
+-                        }
+-                        new_entries++;
+-                    }
++                write_cache_size -= aligned_size;
++                write_entries = (const struct vkd3d_serialized_pipeline_stream_entry *)&write_entries->data[aligned_size];
++            }
+ 
+-                    write_cache_size -= aligned_size;
+-                    write_entries = (const struct vkd3d_serialized_pipeline_stream_entry *)&write_entries->data[aligned_size];
+-                }
++            fclose(merge_file);
++            merge_file = NULL;
++
++            if (new_file)
++            {
++                fclose(new_file);
++                new_file = NULL;
++            }
++
++            if (cancellation || write_failed)
++            {
++                vkd3d_file_delete(new_path);
++                vkd3d_file_rename_overwrite(merge_path, read_path);
++                goto out_cancellation;
+             }
+ 
+-            INFO("Done merging shader caches, existing entries: %u, new entries: %u.\n",
++            INFO("Done merging shader caches, preserved entries: %u, new/overwritten entries: %u.\n",
+                     existing_entries, new_entries);
+ 
+-            fclose(merge_file);
+-            merge_file = NULL;
+-            if (vkd3d_file_rename_overwrite(merge_path, read_path))
++            if (vkd3d_file_rename_overwrite(new_path, read_path))
++            {
+                 INFO("Successfully replaced shader cache with merged cache.\n");
++                vkd3d_file_delete(merge_path);
++            }
+             else
+-                INFO("Failed to replace shader cache.\n");
++            {
++                ERR("Failed to replace shader cache, restoring original cache.\n");
++                vkd3d_file_delete(new_path);
++                vkd3d_file_rename_overwrite(merge_path, read_path);
++                goto out_cancellation;
++            }
+         }
+     }
+ 
+@@ -3144,19 +3243,18 @@ out:
+     vkd3d_file_unmap(&mapped_write_cache);
+     vkd3d_file_delete(write_path);
+ 
+-    /* If we have a stale merge file lying around, we might have been killed at some point
+-     * when we tried to merge the read-only cache earlier.
+-     * We might lose cache data this way, but this shouldn't happen except in extreme circumstances.
+-     * We need to ensure that some thread will eventually be able exclusively create the merge file,
+-     * otherwise, we'll never be able to promote new blobs to the read-only cache.
+-     * In a normal situation, merge_path will never exist at this point. */
++    /* Clean up temporary merge and new files if any remain */
+     vkd3d_file_delete(merge_path);
++    vkd3d_file_delete(new_path);
+ 
+ out_cancellation:
+     vkd3d_file_unmap(&mapped_write_cache);
++    if (new_file)
++        fclose(new_file);
+     if (merge_file)
+         fclose(merge_file);
+-    hash_map_free(&map);
++    hash_map_free(&write_map);
++    hash_map_free(&merged_map);
+     vkd3d_free(tmp_buffer);
+ }
+ 
+-- 
+2.43.0

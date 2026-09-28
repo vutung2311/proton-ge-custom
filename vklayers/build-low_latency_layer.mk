@@ -15,6 +15,14 @@ $(eval $(call rules-source,low_latency_layer,$(SRCDIR)/vklayers/low_latency_laye
 $(eval $(call rules-cmake,low_latency_layer,x86_64,unix))
 $(eval $(call rules-cmake,low_latency_layer,aarch64,unix))
 
+$(OBJ)/.low_latency_layer-post-source:
+	patch_dir="$(realpath "$(SRCDIR)/patches/vklayers")"; \
+	if [ -d "$$patch_dir" ]; then \
+	    find "$$patch_dir" -name "*.patch" | sort | \
+	    while read -r p; do patch -d "$(LOW_LATENCY_LAYER_SRC)" -Np1 -i "$$p"; done; \
+	fi
+	touch $@
+
 $(OBJ)/.low_latency_layer-x86_64-post-build:
 	mkdir -p $(DST_DIR)/share/low_latency_layer/implicit_layer.d/
 	cp -a $(LOW_LATENCY_LAYER_x86_64_DST)/share/vulkan/implicit_layer.d/low_latency_layer.json $(DST_DIR)/share/low_latency_layer/implicit_layer.d/
