@@ -17,4 +17,8 @@ read from the window's own contents (`wwm_grab.py`).
 | `gen_nt_census.sh`, `gen_iocp_purity.sh`, `iocp_purity_report.py` | bpftrace script generators for the profiler and the completion-port census. |
 | `wwm_click.c`, `wwm_windows.c` | In-Wine input and window listing; `wwm_ab_run.sh` builds the `.exe` files when needed. |
 
+Every run launches the game on Wine's X11 driver, whatever the Lutris entry uses for normal play
+(the screen checks read the window through X11); the harness checks the loaded driver and stops a
+run that is not on X11.
+
 Runs write to `telemetry/` (`abrun_<mode>_<stamp>.*`, `vkd3d_queue_*.json`).

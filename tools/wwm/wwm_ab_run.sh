@@ -21,7 +21,8 @@
 #                                            # AUTO_LOAD_SECS (default 100) later. The load end is
 #                                            # taken from the upload trace (QPROFILE=1 is implied).
 #
-# 1. Points the Lutris entry at the runner under test (restored on exit).
+# 1. Points the Lutris entry at the runner under test and forces Wine's X11 driver
+#    (PROTON_ENABLE_WAYLAND=0) for the run; the entry is restored on exit.
 # 2. Starts proton_profiler.py via pkexec with the matching Nt* census script,
 #    or reuses an already-waiting profiler if it uses the same script.
 # 3. Launches the game, records your "teleport started" / "world visible"
@@ -185,6 +186,20 @@ if [ "$current" != "$runner" ]; then
 else
     info "Lutris entry $game_id already uses $runner"
 fi
+
+# Every run uses Wine's X11 driver, whatever the entry says for normal play: the screen checks
+# read the game window through X11 (wwm_grab.py) and all recorded measurements are X11-path
+# numbers. PROTON_ENABLE_WAYLAND=0 for this run only, restored on exit like the runner swap.
+if ! grep -qE "^    PROTON_ENABLE_WAYLAND: ['\"]?0['\"]?$" "$yml"; then
+    backup_config_once
+    sed -i "/^    PROTON_ENABLE_WAYLAND: /d" "$yml"
+    grep -q '^    WINEDEBUG: ' "$yml" || die "no WINEDEBUG entry under system.env in $yml"
+    sed -i "/^    WINEDEBUG: /a\\    PROTON_ENABLE_WAYLAND: '0'" "$yml"
+    info "display: X11 forced for this run (temporary config change)"
+else
+    info "display: X11 (the entry already uses it)"
+fi
+echo "display_driver x11" >>"$markers"
 
 # PROTONLOG=1: Proton log with exception/loader channels, written into telemetry/.
 # The Lutris config sets WINEDEBUG=-all and Lutris runs as a persistent app, so the
@@ -416,6 +431,12 @@ if [ "${AUTO:-0}" = "1" ]; then
         sleep 2
     done
     login_dialog_up || die "no login dialog (MPAY_SWITCH_ACCOUNT) within 300 s"
+    # A window exists now, so the display driver is loaded: it must be X11 (see above).
+    game_maps="/proc/$(pgrep -xo wwm.exe)/maps"
+    if grep -q 'winewayland' "$game_maps" || ! grep -q 'winex11' "$game_maps"; then
+        pkill -x wwm.exe
+        die "the game is not on Wine's X11 driver; screen checks cannot read it (game stopped)"
+    fi
     sleep "${AUTO_CLICK_DELAY:-2}"
     # "Log In" in the dialog: posted to the dialog window, which handles it without focus. The
     # dialog is a separate fixed-size window (360x380), so its fraction does not depend on the
