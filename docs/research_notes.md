@@ -3539,6 +3539,26 @@ No single experiment found the cause; each one narrowed where it could be.
     carries it, and `build_runner.sh` checks `TrimEnabled=1` after every build so a future Wine update
     cannot silently lose it again.
 
+**What the memory dump of the game (`unpacked_wwm.exe`) contributed.** The shipped executable
+is packed and resolves its imports at run time, so traces of it show only anonymous addresses.
+Read-only analysis of the user's dump of the running image turned the middle of the investigation
+(steps 4-6) from guesswork into targeted tests:
+- *It removed a false lead.* Disassembling the post site `0x1402a8980` showed Boost.Asio's
+  `win_iocp_io_context::shutdown()`, not the "1 ms bailout" semaphore check that §19 and §22 had
+  built a theory on (§34.7).
+- *It chose the experiments.* The image's references to `IsProcessorFeaturePresent`,
+  `GetEnabledXStateFeatures` and `GetXStateFeaturesMask` prompted the CPU-feature test (patch
+  `0004`), and its 17 `zmm` instructions and absence of `rep movs/stos` samples bounded what that
+  test could mean; its references to thread-pool timers, `SetWaitableTimerEx`, completion-mode
+  settings through `NtSetInformationFile` and `WaitOnAddress` are why exactly those test programs
+  were written (§35.3).
+- *It made the traces readable.* Instruction-pointer samples were attributed to the game image by
+  its `SizeOfImage`, and the packets' handler tags were identified as generic Asio completion
+  functions, which retracted the "0.8 s fallback poll" hypothesis (§35.3).
+Without it, steps 4-6 could only have tested guesses about what the game does. Steps 1-3 and 8-10
+did not depend on it, but step 9's result only meant something because steps 4-6 had already
+ruled the alternatives out.
+
 The negative results were not wasted: each one removed a class of explanations, which is why the
 single differing storage answer could be recognised as the cause rather than as one more
 candidate. With the load fixed, the remaining Wine 11 overhead was steady-state completion-port IPC
