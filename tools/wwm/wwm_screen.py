@@ -4,6 +4,10 @@ focus change), read by OCR of a few fixed regions. Used by wwm_ab_run.sh AUTO=1 
 the game shows, catch dialogs and disconnects, and time the moment the world HUD appears.
 
   wwm_screen.py state                         one full check now: prints "<state> | <text>"
+  wwm_screen.py locate <label> [--pick lowest] [--image f]
+                                              where a text label (a button) is now: prints
+                                              "<fx> <fy> <conf> <pass>" as client-area fractions,
+                                              exit 1 when it is not on screen
   wwm_screen.py record <dir> [--interval 1]   until the window is gone or SIGTERM: every interval
                                               save <dir>/<epoch>.jpg (1280 wide) and append a line
                                               to <dir>/states.tsv
@@ -224,10 +228,111 @@ def cmd_scan(a):
     return 0
 
 
+def ocr_words(img, psm, may_crash=False):
+    """Words tesseract reads in img: (text, conf, x, y, w, h, line key) in img pixels.
+
+    may_crash: tesseract dies with SIGFPE on some noise crops (rain streaks read as a "line");
+    for such a crop return None instead of raising, so one unreadable line does not end a search."""
+    buf = io.BytesIO()
+    img.save(buf, 'PNG')
+    r = subprocess.run(['tesseract', 'stdin', 'stdout', '-l', 'vie', '--psm', str(psm), 'tsv'],
+                       input=buf.getvalue(), capture_output=True, env=OCR_ENV)
+    if r.returncode != 0:
+        if may_crash and r.returncode < 0:
+            print(f'tesseract killed by signal {-r.returncode} on a {img.width}x{img.height} line crop; skipped',
+                  file=sys.stderr)
+            return None
+        raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+    words = []
+    for line in r.stdout.decode('utf-8', 'replace').splitlines()[1:]:
+        f = line.split('\t')
+        if len(f) < 12 or not f[11].strip():
+            continue
+        x, y, w, h = map(int, f[6:10])
+        words.append((f[11], float(f[10]), x, y, w, h, (f[2], f[3], f[4])))
+    return words
+
+
+def find_label(im, label, min_conf, pick='best'):
+    """Centre of the on-screen text label as client-area fractions (fx, fy, conf, pass), or None.
+
+    pick: 'best' (highest confidence) or 'lowest' (largest fy) when the text occurs more than once,
+    e.g. "Continue" in both the message and the button hint of the already-online dialog. Both
+    passes run for 'lowest', so a small hint found only by pass 2 still counts.
+
+    Pass 1 reads the whole window as sparse text. Small labels next to key badges ("Space
+    Continue") are often missed there, so pass 2 re-reads each text line pass 1 found, cropped
+    wide around it and scaled up, as a single line. Positions scale with the window, so this
+    holds for any resolution, aspect ratio or UI scale."""
+    target = norm(label)
+    w, h = im.size
+    gray = ImageOps.grayscale(im)
+    s1 = max(1.0, 1440 / h)   # read at >= 1440 lines, where the menu text is ~20 px high
+    base = gray.resize((round(w * s1), round(h * s1)), Image.LANCZOS) if s1 > 1 else gray
+    found = []
+
+    def consider(text, conf, cx, cy, how):
+        if conf >= min_conf and target and target in norm(text):
+            found.append((cx / w, cy / h, conf, how))
+
+    def choose():
+        if not found:
+            return None
+        return max(found, key=(lambda f: f[2]) if pick == 'best' else (lambda f: f[1]))
+
+    words = ocr_words(base, 11)
+    for text, conf, x, y, ww, hh, _ in words:
+        consider(text, conf, (x + ww / 2) / s1, (y + hh / 2) / s1, 'sparse')
+    if found and pick == 'best':
+        return choose()
+    lines = {}
+    for text, conf, x, y, ww, hh, key in words:
+        lines.setdefault(key, []).append((x / s1, y / s1, (x + ww) / s1, (y + hh) / s1))
+    for boxes in lines.values():
+        x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
+        x1 = max(b[2] for b in boxes); y1 = max(b[3] for b in boxes)
+        lh = max(1.0, y1 - y0)
+        cx0, cx1 = max(0, x0 - 0.10 * w), min(w, x1 + 0.15 * w)
+        cy0, cy1 = max(0, y0 - lh), min(h, y1 + lh)
+        s2 = max(1.0, 60 / lh)   # text ~60 px high for the single-line pass
+        crop = gray.crop((int(cx0), int(cy0), int(cx1), int(cy1)))
+        crop = crop.resize((max(1, round(crop.width * s2)), max(1, round(crop.height * s2))), Image.LANCZOS)
+        for text, conf, x, y, ww, hh, _ in ocr_words(crop, 7, may_crash=True) or ():
+            consider(text, conf, int(cx0) + (x + ww / 2) / s2, int(cy0) + (y + hh / 2) / s2, 'line')
+    return choose()
+
+
+def cmd_locate(a):
+    if a.image:
+        im = Image.open(a.image).convert('RGB')
+    else:
+        try:
+            im = Grabber().grab()
+        except NotFound:
+            print('no_window', file=sys.stderr)
+            return 3
+        except NotViewable:
+            print('unviewable', file=sys.stderr)
+            return 4
+    found = find_label(im, a.label, a.min_conf, a.pick)
+    if not found:
+        print(f'label {a.label!r} not found', file=sys.stderr)
+        return 1
+    fx, fy, conf, how = found
+    print(f'{fx:.4f} {fy:.4f} {conf:.0f} {how}')
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
     sub.add_parser('state')
+    lo = sub.add_parser('locate', help='print "fx fy conf pass" of a text label in the game window')
+    lo.add_argument('label')
+    lo.add_argument('--image', help='read this saved frame instead of grabbing the window')
+    lo.add_argument('--min-conf', type=float, default=70.0)
+    lo.add_argument('--pick', choices=('best', 'lowest'), default='best',
+                    help='when the text occurs more than once: highest confidence, or lowest on screen')
     r = sub.add_parser('record')
     r.add_argument('dir')
     r.add_argument('--interval', type=float, default=1.0)
@@ -241,7 +346,8 @@ def main():
     s.add_argument('teleport_start', type=float)
     s.add_argument('--settle', type=float, default=5.0, help='seconds without the loading overlay after the HUD')
     a = ap.parse_args()
-    return {'state': cmd_state, 'record': cmd_record, 'progress': cmd_progress, 'scan': cmd_scan}[a.cmd](a)
+    return {'state': cmd_state, 'locate': cmd_locate, 'record': cmd_record, 'progress': cmd_progress,
+            'scan': cmd_scan}[a.cmd](a)
 
 
 if __name__ == '__main__':

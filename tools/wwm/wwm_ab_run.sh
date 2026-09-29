@@ -380,6 +380,33 @@ click_until() {
     return 1
 }
 
+# Click a labelled button in the game window until the game logs $pattern after line $after.
+# Attempts 1 and 3 click where the label is on screen (wwm_screen.py locate: holds at any
+# resolution, aspect ratio or UI scale); attempt 2, and any attempt whose label is not on screen,
+# clicks the fixed fraction measured at 2560x1440. The position that registered goes into the
+# markers as "<key>_click <fx> <fy> <source>".
+click_label_until() {
+    local after="$1" pattern="$2" what="$3" key="$4" label="$5" pick="$6" fx="$7" fy="$8"
+    local n attempt pos x y conf how src
+    for attempt in 1 2 3; do
+        if [ "$attempt" != 2 ] && pos="$(python3 "$TOOLS/wwm_screen.py" locate "$label" --pick "$pick")"; then
+            read -r x y conf how <<<"$pos"
+            src="screen:ocr-conf-$conf"
+        else
+            x="$fx"; y="$fy"; src="fixed-2560x1440"
+        fi
+        info "AUTO: $what at ($x, $y) [$src]" >&2
+        wine_click --fake-active --post "$x" "$y"
+        if n="$(wait_log "$pattern" "$after" 10)"; then
+            echo "${key}_click $x $y $src" >>"$markers"
+            echo "$n"
+            return 0
+        fi
+        info "AUTO: $what not registered (attempt $attempt)" >&2
+    done
+    return 1
+}
+
 echo
 if [ "${AUTO:-0}" = "1" ]; then
     info "AUTO: waiting for the NetEase login dialog"
@@ -390,14 +417,16 @@ if [ "${AUTO:-0}" = "1" ]; then
     done
     login_dialog_up || die "no login dialog (MPAY_SWITCH_ACCOUNT) within 300 s"
     sleep "${AUTO_CLICK_DELAY:-2}"
-    # "Log In" in the dialog: posted to the dialog window, which handles it without focus.
+    # "Log In" in the dialog: posted to the dialog window, which handles it without focus. The
+    # dialog is a separate fixed-size window (360x380), so its fraction does not depend on the
+    # game's resolution.
     ln="$(click_until 0 'on_redis_get_account_back' 'Log In' --class MPAY_SWITCH_ACCOUNT --post 0.5000 0.6660)" || \
         die "the game did not register the Log In click (see $gamelog)"
     echo "login_clicked $(log_time "$ln")" >>"$markers"
     sleep "${AUTO_CLICK_DELAY:-4}"
     # "Resume" (where "Start" was): the game ignores input while it thinks it is inactive, so post
     # WM_ACTIVATEAPP/WM_ACTIVATE/WM_SETFOCUS to its window first (desktop focus is not touched).
-    cl="$(click_until "$ln" 'on_click_game_start' 'Resume' --fake-active --post 0.8648 0.4063)" || \
+    cl="$(click_label_until "$ln" 'on_click_game_start' 'Resume' resume Resume best 0.8648 0.4063)" || \
         die "the game did not register the Resume click (see $gamelog)"
     echo "resume_clicked $(log_time "$cl")" >>"$markers"
     # Load start: on_become_player follows the Resume click within a second and is logged
@@ -410,7 +439,8 @@ if [ "${AUTO:-0}" = "1" ]; then
     if ! tp="$(wait_log 'on_become_player' "$((cl - 1))" 8)"; then
         if wait_log 'try_to_relay_other' "$((cl - 1))" 1 >/dev/null || screen_seen already_online "$resume_epoch"; then
             info "AUTO: 'account already online' dialog; clicking Continue"
-            tp="$(click_until "$cl" 'on_become_player' 'Continue' --fake-active --post 0.5320 0.5850)" || \
+            # "Continue" also appears in the message above the hint: take the lowest occurrence.
+            tp="$(click_label_until "$cl" 'on_become_player' 'Continue' continue Continue lowest 0.5320 0.5850)" || \
                 die "the game did not register the Continue click (see $gamelog)"
         else
             tp="$(wait_log 'on_become_player' "$((cl - 1))" 52)" || die "no on_become_player within 60 s of Resume (see $gamelog)"
