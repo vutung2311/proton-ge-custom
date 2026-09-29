@@ -8,7 +8,7 @@ read from the window's own contents (`wwm_grab.py`).
 | Tool | Purpose |
 | :--- | :--- |
 | `wwm_ab_run.sh <mode>` | One run: points the Lutris entry at the runner (restored on exit), launches the game, logs in, teleports, quits. `AUTO=1` hands-free, `NOPROFILE=1` no bpftrace, `PROTONLOG=1` Proton log (`PROTONLOG_DEBUG` picks the channels), `EXTRA_ENV`, `BT`. See the header for all modes and switches. |
-| `wwm_screen.py` | Screen recorder and classifier (loading bar, world HUD, dialogs); `scan` derives `world_visible`. |
+| `wwm_screen.py` | Screen recorder and classifier (loading bar, world HUD, dialogs); `scan` derives `world_visible`; `locate` finds a button by its text, so the harness clicks Resume and Continue where they are at any resolution, aspect ratio or UI scale (fixed 2560x1440 fractions are the logged second attempt). |
 | `wwm_grab.py` | Read-only XComposite capture of the game window. |
 | `wwm_cpu.py` | Per-second CPU and context switches of the game and its wineserver; `report` compares runs. |
 | `frametimes.py` | In-world frame-time statistics from vkd3d-proton's queue trace. |

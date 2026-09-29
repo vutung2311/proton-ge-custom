@@ -1,6 +1,6 @@
 # Research Notes: Investigation of "Last 3%" Loading Bottleneck in Where Winds Meet (`wwm.exe`)
 
-## Executive Summary (revised 2026-09-28 — read §36 first)
+## Executive Summary (revised 2026-09-29 — read §36 first; §36.1 explains how it was found)
 - **ROOT CAUSE (2026-09-28 17:22, §36).** Wine 11's `mountmgr.sys` answers
   `IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceTrimProperty)` with `STATUS_NOT_SUPPORTED`;
   GE-Proton10-34's answered `TrimEnabled=1`. Where Winds Meet issues storage property queries during
@@ -13,7 +13,10 @@
   `0007-ntdll-in-process-completion-ports.patch` (replaces the old `0001`) serves the game's own ports
   in-process: **total CPU 3.11 → 2.60 cores, wineserver 0.29 → 0.04 cores, game context switches
   ~190 k/s → ~37 k/s**, with unchanged load time (13.7 / 13.8 s) and frame pacing (100 fps cap).
-- **The core problem, measured end to end.** A teleport load (Enter pressed at teleport start → Enter pressed when the loading overlay is gone and the world renders) takes **8.9–18.0 s on GE-Proton10-34** and **47.0–64.4 s on every GE-Proton 11 build tested** (Valve-based custom, GE-based custom). Same Lutris environment, same prefix, same machine, no memory pressure. Full run table in §34.1.
+- **Frame hitches (2026-09-28, §38).** In-world hitches (frames > 25 ms) appeared only in runs with
+  the low-latency layer (Anti-Lag 2) on, on either build; the TRIM fix did not change frame timing.
+  The layer is still on in Lutris entry 11; a layer-off retest is pending.
+- **The core problem, measured end to end.** A teleport load (Enter pressed at teleport start → Enter pressed when the loading overlay is gone and the world renders) takes **8.9–18.0 s on GE-Proton10-34** and **47.0–64.4 s on every GE-Proton 11 build tested before the §36 fix** (Valve-based custom, GE-based custom). Same Lutris environment, same prefix, same machine, no memory pressure. Full run table in §34.1.
 - **The regression is not in d3d12/vkd3d-proton, not in the job system and not in the completion-port layer.** vkd3d-proton's own queue timeline (§34.4) shows the renderer running *faster* on 11, uploads executing in the same 115 µs, and no pipeline compiles. The job system's IOCP task rate per second is the same on 10 and 11 (§34.3); its larger totals on 11 only reflect a longer load.
 - **Superseded lead (see §36): a lost wakeup in the asset-streaming path.** On GE-Proton 11 the streamer submits one GPU upload per timer tick on a strict **+600.1 ms / +999.9 ms** cadence (±0.1 ms) for ~36 s between two upload bursts. GE-Proton10-34 shows no such cadence. The streaming thread therefore only advances when a 600 ms or 1000 ms timed wait expires; the signal that should end those waits early does not arrive. Which wait primitive loses the wake is the open question (§34.6).
 - **Much of §1–§33 is superseded.** Sections that used telemetry-inferred "settle" windows, the `Start-Load-LoginWindow` log line, or thrashed/instrumented builds reached conclusions the end-to-end measurements contradict. See the correction list in §34.7 before relying on any earlier section.
@@ -69,6 +72,9 @@ Below is the exhaustive, empirical measurement matrix across all 15 teleport tra
 ---
 
 ## 2. The Architectural Root Causes in `inproc_iocp`
+
+> **Superseded (2026-09-28, §36):** the slow load was not caused by the completion-port layer; the
+> root cause is Wine 11's missing `StorageDeviceTrimProperty` answer, fixed by patch `0006`.
 
 The 8.86x expansion in worker CPU time and the 3x collapse in wave processing rate across ALL 11 runs of GE-Proton 11 custom are directly traceable to specific architectural decisions in `patches/wine-hotfixes/pending/0001-inproc-iocp-event-driven.patch`:
 
@@ -3076,6 +3082,9 @@ agrees with §19.2's DLL-swap result.
 
 ### 34.5 The Lead: A Strict 600 ms / 1000 ms Upload Cadence on Wine 11
 
+> **Resolved (§36):** the paced cadence is the game's non-SSD streaming mode, chosen because Wine 11
+> did not report TRIM. It disappears with patch `0006`; no wakeup is lost.
+
 Copy submissions per 2 s across the load:
 
 ```
@@ -3100,6 +3109,9 @@ finish items, one per ~0.8 s. §35 traces the chain to the workers and to a CPU-
 dependent code path.
 
 ### 34.6 Open Question and Next Steps
+
+> **Answered (§36):** no wait loses a wakeup; the game deliberately streams slowly when the disk
+> reports no TRIM support. The steps below were not needed.
 
 1. **Which wait loses the wakeup.** `scratch/gen_wait_timeouts.sh <runner>` generates a
    bpftrace script recording every wait ≥ 50 ms through `NtWaitForSingleObject`,
@@ -3156,6 +3168,9 @@ dependent code path.
 ---
 
 ## 35. The Chain to the Root Cause: Asset Workers Take a Different Code Path on Wine 11 Because `IsProcessorFeaturePresent` Reports More Features (2026-09-28)
+
+> **Not the root cause (§35.3, §36):** hiding the extra CPU features did not change the load; the
+> different code path is the non-SSD streaming mode, which the missing TRIM answer selects (§36).
 
 Method as in §34 (keypress-bracketed loads; runner rebuilt on stock GE-Proton11-7 + custom
 patches after the rebase, §34.2). New instruments, all under `scratch/`: `wait_timeouts_*.bt`
@@ -3294,7 +3309,8 @@ run time: no SystemBiosDate, FeatureSet 0xebf9bfff) the load took 46.9 s with a 
 between upload bursts. Not the cause.
 
 The pause's trigger lives in the game's encrypted Lua scripts. Next step: bisect across prebuilt
-upstream Wine development releases (10.1 … 11.0-rc) in a separate prefix, ~5 runs.
+upstream Wine development releases (10.1 … 11.0-rc) in a separate prefix, ~5 runs. (Not needed:
+the trigger is the storage query answer, §36.)
 
 **Hands-free runs (`AUTO=1`, 2026-09-28).** `tools/wwm/wwm_ab_run.sh` can now run a load without
 keypresses and without touching the desktop: `tools/wwm/wwm_click.exe` (run with the runner's wine in
@@ -3403,6 +3419,8 @@ back to the login window, a disconnect dialog appears, or the game exits during 
 Continue click also falls back to the screen when the log lacks `try_to_relay_other`. After the run,
 `world_visible` = first of three consecutive frames with the world HUD (`world_visible_source
 screen:hud`), which also satisfies the "loading overlay dismissed" condition of the settle rule.
+(Revised in §37: the first frame after the last loading-bar frame, confirmed by the HUD within 5 s,
+because HUD OCR misses frames in dark and bright scenes.)
 
 ### 35.3a Experiment setup (original plan)
 
@@ -3422,7 +3440,9 @@ is confirmed, then single-flag runs identify the bit, and the fix is a default f
   `nvidia-libs/dxvk-nvapi` in `.gitmodules` without an index entry.
 - bpftrace on x86_64 exposes only `arg0–arg5`; 7th+ arguments are read from `reg("sp")+8*n`.
   `ustack` stops at `__wine_syscall_dispatcher` (PE frames live on the other stack).
-- The scratchpad is temp-cleaned; analysis scripts now live under `scratch/`.
+- The scratchpad is temp-cleaned; analysis scripts now live under `scratch/`, which is untracked.
+  The harness and the report tools it and §37 use moved to `tools/wwm/` on 2026-09-29; the one-off
+  `scratch/` scripts named in §35 are not in the repository.
 
 ## 36. Root Cause: Missing `StorageDeviceTrimProperty` in Wine 11's mountmgr.sys (2026-09-28)
 
@@ -3472,6 +3492,57 @@ non-SSD streaming mode: the paced one-item-per-0.75 s trickle between bursts, th
 both runtimes (the game was never slower per unit of work, it was doing less per second by design).
 The wait/wake, completion, timer, CPU-feature, topology, memory and identity experiments were correctly
 negative.
+
+### 36.1 How the Pieces Led to TRIM
+
+No single experiment found the cause; each one narrowed where it could be.
+
+1. **Measure the real problem (§34.1).** Loads bracketed by the player's own keypresses replaced
+   the telemetry-inferred "settle" windows of §1-§33: 8.9-18.0 s on GE-Proton10-34, 47-64 s on
+   every Wine 11 build, with the low-latency layer on or off. This showed the regression was real
+   and large, and that most earlier "fixes" had never been measured end to end (§34.7).
+2. **Compare like with like (§34.2).** The runner called "custom" turned out to be Valve Wine 11
+   without GE's patches, and the Lutris "stock" 11-7 had been hand-modified. `build_runner.sh`
+   was rebuilt to produce real GE-Proton 11 plus our patches from pinned commits, so every later
+   difference was Wine 10 vs Wine 11, not a build accident.
+3. **Find where the time goes (§34.4-§34.5).** vkd3d-proton's queue timeline showed the renderer
+   was not slower: uploads took the same 115 µs and no pipeline compiled late. The difference was
+   *when* the game streamed: two upload bursts separated by ~4 s on 10 but ~36 s on 11, with a
+   slow one-item trickle in between. The question became why the game waits, not why Wine is slow.
+4. **Clear Wine's primitives (§34.3, §35.1, §35.3).** The Nt* census, wait, futex and wake-graph
+   traces, and small test programs for timers, thread-pool timers, overlapped reads and completion
+   modes found no lost wakeup, no late timer, no slow read and an unchanged job system. CPU per
+   second of load was the same on both runtimes, so the load was paced, not starved.
+5. **Clear what the game can see about the machine (§35.2-§35.3).** CPU features
+   (`WINE_HIDE_CPU_FEATURES`, patch `0004`), system identity and BIOS keys (patch `0005`), CPU
+   topology, memory status, graphics DLLs (the `gfx10` runner) and network traffic (pcap) were each
+   made to match GE-Proton10-34 or compared directly. None changed the load. What remained was
+   some other answer Windows gives the game that differs on Wine 11.
+6. **Show the pause is a decision (§35.3, main-thread traces).** Packet-level traces of the main
+   thread showed each load milestone taken while handling an ordinary 10 ms tick: the game polls a
+   condition and acts when it turns true. No blocking wait ended late; the gate was the game's own
+   logic choosing to go slowly.
+7. **Make runs cheap and exact (§35.3, hands-free runs).** `AUTO=1` runs logged in, loaded and quit
+   without keypresses or desktop focus, and the screen recorder read the loading overlay. Its OCR
+   showed the game's own progress counter advancing in near-fixed 15-18 s steps through the last
+   three percent: the game was pacing itself, and repeat runs matched within about a second.
+8. **Look for what the game asks during the slow phase (§36).** The per-second device-ioctl
+   counters in the same capture showed a game thread issuing storage property queries
+   (`IOCTL_STORAGE_QUERY_PROPERTY`) and volume-extent queries about once a second through the pause.
+9. **Ask both runtimes the same questions (§36).** `tests/run_storage.sh` sent every storage and
+   volume query to both runtimes in throwaway prefixes. Exactly one answer differed:
+   StorageDeviceTrimProperty, `TrimEnabled=1` on 10 and "not supported" on 11. Without TRIM the game
+   treats the disk as non-SSD and streams in its slow paced mode, which is everything seen in steps
+   3-7.
+10. **Change only that (§36).** A runner identical except for a rebuilt `mountmgr.sys` reporting
+    TRIM loaded in 11.6 and 11.7 s with a 2.4-2.8 s pause, the GE-Proton10-34 profile. Patch `0006`
+    carries it, and `build_runner.sh` checks `TrimEnabled=1` after every build so a future Wine update
+    cannot silently lose it again.
+
+The negative results were not wasted: each one removed a class of explanations, which is why the
+single differing storage answer could be recognised as the cause rather than as one more
+candidate. With the load fixed, the remaining Wine 11 overhead was steady-state completion-port IPC
+(§37).
 
 
 ## 37. In-Process Completion Ports (patch 0007) Replace the Old 0001 (2026-09-28)
@@ -3539,3 +3610,70 @@ region, because the bottom band's player id / FPS overlay OCRs into stray "N %")
 `gamelog:on_become_player`. `PROTONLOG=1` runs set Lutris `show_debug: inherit`, otherwise Lutris
 forces `WINEDEBUG=-all`. A running Lutris caches its Proton list at startup; the harness now refuses
 runners newer than the Lutris process instead of letting the game start under Lutris's default Proton.
+
+## 38. Launch Configuration, Low-Latency Layer and Harness Findings (2026-09-28/29)
+
+**Lutris entry 11 audit (`where-winds-meet-1769082036.yml`, runner GE-Proton11-custom).** Each
+setting was checked against the runner, Mesa, umu and a live game snapshot before removal; a live
+run after the cleanup loaded in 12.2 s, still on ntsync, with the same libraries loaded.
+
+| Removed | Why it had no effect |
+| :--- | :--- |
+| `PROTON_USE_NTSYNC`, `PROTON_USE_FSYNC`, `PROTON_NO_NTSYNC`, `WINEFSYNC`, `WINENTSYNC` | The Proton script never reads `PROTON_USE_*`, forces `WINEFSYNC=1` and enables ntsync by default; the game ran with 208 ntsync handles and no eventfds. |
+| `DXVK_ASYNC`, `DXVK_FRAME_PACE` | Not in this DXVK (nor GE-Proton10-34's). |
+| `WINE_DISABLE_FLUSH` | Exists in neither Wine 10 nor Wine 11. |
+| `WINE_LARGE_ADDRESS_AWARE` | 32-bit only; the game is 64-bit. |
+| `UMU_NO_RUNTIME` | Nothing reads it; the game always runs in the Steam Runtime container. |
+| `RADV_PERFTEST` `sam` | Not an option in this Mesa (`cswave32`, `gewave32` are kept). |
+| `VKD3D_CONFIG` `upload_hvv` and four allocator/cache flags | Not an option, or already forced for `wwm.exe` by our vkd3d-proton patch. |
+| `WINE_FULLSCREEN_FSR`, `SDL_GAMECONTROLLER_IGNORE_DEVICES`, `PROTON_NO_STEAMINPUT` | Overridden by Lutris's FSR option, or set/deleted by Proton when `PROTON_PREFER_SDL=1`. |
+| `PROTON_ENABLE_HDR` | X11 path (`PROTON_ENABLE_WAYLAND=0`): no HDR. |
+| DLL override `GFSDK_Aftermath=d` | Matches no loaded DLL. |
+
+`libxess=d` does have an effect (XeSS starts loading without it) and was restored. Open decisions:
+NVIDIA API emulation (`PROTON_ENABLE_NVAPI=1` with `DXVK_NVAPI_ALLOW_OTHER_DRIVERS=1`, which can
+present the AMD GPU to the game as NVIDIA), and the in-game 100 fps cap, which hides throughput
+differences in every A/B run.
+
+**Low-latency layer and frame hitches.** `LOW_LATENCY_LAYER=1` (AMD Anti-Lag 2 on this card;
+`LOW_LATENCY_LAYER_REFLEX` is NVIDIA-only and was removed) was switched on at ~18:28 on 2026-09-28.
+In-world frame timing of the hands-free runs that day (standing at the spawn point, 100 fps cap):
+
+| Build / config | Runs | In-world frame timing |
+| :--- | :--- | :--- |
+| Wine 11 without TRIM, layer off | 5 | p99 10.5-10.8 ms, 0-1 frames > 25 ms |
+| Wine 11 with TRIM, layer off | 5 | p99 10.4-10.6 ms, 0-1 frames > 25 ms |
+| Wine 11 with TRIM, layer on | 4 | one run 91.8 fps, p99 42 ms, 97 frames > 25 ms; one run 4 frames > 25 ms (worst 40 ms); two clean |
+| GE-Proton10-34, layer off | 4 | p99 10.5-11.2 ms, 0-1 frames > 25 ms |
+
+With the layer off, the TRIM fix changed nothing about in-world frame timing. The layer was still
+on for all thirteen §37 A/B runs, so the occasional 20-30 ms frames there (and one 69.5 ms hitch
+on the runner without 0007) are consistent with this pattern and are not attributable to either
+runner. A layer-off retest is the pending step; these runs do not cover drops while moving.
+
+The §37 loads (13.0-15.0 s) are ~2 s longer than §36's (11.6-12.1 s). They differ in the layer (on
+vs off) and in the load-end rule (loading bar gone vs world HUD), and the in-game time of day
+varies between runs; which of these accounts for the 2 s was not measured. Within §37 both runners shared all
+three conditions, so its A/B comparison holds.
+
+**Prefix version stamp.** `~/.wine/version` holds Proton's `CURRENT_PREFIX_VERSION`, which is
+`GE-Proton11-7` for every runner built from that template, custom ones included; `config_info`
+records the runner paths. A launch under a different runner rewrites `config_info` and re-copies
+Proton's built-in DLLs; the next launch under the usual runner restores its own. A running Lutris
+caches its Proton list at startup, so a runner created afterwards silently falls back to Lutris's
+default Proton; `tools/wwm/wwm_ab_run.sh` now refuses such runners.
+
+**Other results.**
+- *Rebase:* as of 2026-09-28 the branch sits on GE master `8473e3d2` and uses GE-Proton11-7, the
+  newest release, as its template; a rebase would change nothing.
+- *`configure_wine_input.sh`* (local_diagnostic repository) now honours `--prefix`/`WINEPREFIX` and
+  takes Wine from the prefix's `config_info`, instead of searching `PATH`.
+- *Harness clicks:* `wwm_screen.py locate` finds a button by its text (sparse OCR of the window,
+  then a single-line pass per text line for small hint labels; `--pick lowest` when the text also
+  occurs in a dialog's message). On saved frames at 960x540 to 2560x1440 it found Resume at
+  (0.878-0.880, 0.407-0.411) and Continue at (0.553, 0.585-0.587), in 0.8 s and 2.8 s. The harness
+  clicks the located position first and the fixed 2560x1440 fraction as the logged second attempt,
+  so a change of aspect ratio or UI scale no longer depends on the fixed fractions.
+- *`docs/walkthrough.md`* (2026-09-12 to 09-28, removed at the rebase) was a session diary of the
+  old in-process IOCP work, not maintained documentation; §34.7 lists its refuted claims. It remains
+  in `backup/ge-proton11-custom-pre-squash-20260928`.
