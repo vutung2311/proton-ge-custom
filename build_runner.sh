@@ -629,9 +629,19 @@ if [ -f "${BUILD_ROOT}/obj-low_latency_layer-x86_64/libVkLayer_KORTHOS_LowLatenc
     cp -f "${BUILD_ROOT}/obj-low_latency_layer-x86_64/libVkLayer_KORTHOS_LowLatency.so" "${RUNNER_DST}/files/lib/x86_64-linux-gnu/"
 fi
 if [ -f "${BUILD_ROOT}/obj-low_latency_layer-x86_64/low_latency_layer.json" ]; then
-    mkdir -p "${RUNNER_DST}/files/share/low_latency_layer/implicit_layer.d"
-    sed 's|"library_path": ".*libVkLayer_KORTHOS_LowLatency.so"|"library_path": "libVkLayer_KORTHOS_LowLatency.so"|g' \
-        "${BUILD_ROOT}/obj-low_latency_layer-x86_64/low_latency_layer.json" > "${RUNNER_DST}/files/share/low_latency_layer/implicit_layer.d/low_latency_layer.json"
+    # Point the manifest at the runner's own copy by a path relative to the manifest. A bare file
+    # name would be looked up on the library search path, where another build of the same layer
+    # (e.g. /usr/lib) can win.
+    LL_MANIFEST_DIR="${RUNNER_DST}/files/share/low_latency_layer/implicit_layer.d"
+    LL_LIB_REL="../../../lib/x86_64-linux-gnu/libVkLayer_KORTHOS_LowLatency.so"
+    mkdir -p "${LL_MANIFEST_DIR}"
+    sed 's|"library_path": ".*libVkLayer_KORTHOS_LowLatency.so"|"library_path": "'"${LL_LIB_REL}"'"|g' \
+        "${BUILD_ROOT}/obj-low_latency_layer-x86_64/low_latency_layer.json" > "${LL_MANIFEST_DIR}/low_latency_layer.json"
+    if ! grep -qF "\"library_path\": \"${LL_LIB_REL}\"" "${LL_MANIFEST_DIR}/low_latency_layer.json" ||
+            [ ! -f "${LL_MANIFEST_DIR}/${LL_LIB_REL}" ]; then
+        err "low_latency_layer manifest does not point at the runner's library (${LL_MANIFEST_DIR}/${LL_LIB_REL})"
+        exit 1
+    fi
 fi
 
 # vkd3d-proton goes where stock GE keeps it; the proton script installs it into the

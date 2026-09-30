@@ -92,6 +92,8 @@ if [ "$WINE_ONLY" != "1" ]; then
     git clean -xdf
     echo "LOW_LATENCY_LAYER: use relative library path"
     apply_all_in_dir "../../patches/low_latency_layer"
+    echo "LOW_LATENCY_LAYER: no busy waits (timestamp reaper, delay controller), present ID read before the present"
+    apply_all_in_dir "../../patches/vklayers"
     popd
 
 ### END PREP SECTION ###

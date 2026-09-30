@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XProtocol Bot <dmitriy@xprotocol.org>
+Date: Tue, 29 Sep 2026 20:02:32 +0700
+Subject: [PATCH] low_latency_layer: block instead of spinning in the delay controller
+
+The frame limit (the sleep mode's minimum interval) and the jitter/drain
+delay waited in a yield() loop, keeping a CPU core busy for the whole wait on
+every frame; with a frame cap below the display's refresh rate that is several
+milliseconds per frame, taken from the game's own threads. DeviceClock is
+CLOCK_MONOTONIC and satisfies the Clock requirements, so sleep until the
+deadline instead. Timer slack adds tens of microseconds at most.
+---
+--- a/src/delay_controller.cc
++++ b/src/delay_controller.cc
+@@ -1,6 +1,7 @@
+ #include "delay_controller.hh"
+ 
+ #include <algorithm>
++#include <thread>
+ 
+ namespace low_latency {
+ 
+@@ -21,11 +22,10 @@
+ 
+     const auto frametime = DeviceClock::now() - this->previous_frame->release;
+ 
+-    // Apply frame limits if nonzero min_delay.
++    // Apply frame limits if nonzero min_delay. Block rather than spin: this
++    // runs every frame, and a frame cap can leave several ms to wait.
+     if (min_delay != 0ns) {
+-        while (DeviceClock::now() < this->previous_frame->release + min_delay) {
+-            std::this_thread::yield();
+-        }
++        std::this_thread::sleep_until(this->previous_frame->release + min_delay);
+     }
+ 
+     // Early out and don't apply jitter or delays if we know the application has
+@@ -41,11 +41,7 @@
+     // Apply jitter and drain.
+     const auto jitter =
+         this->previous_frame->jitter == 0ns ? frametime / 50 : 0ns;
+-    for (const auto start = DeviceClock::now();
+-         DeviceClock::now() < start + jitter + this->drain;) {
+-
+-        std::this_thread::yield();
+-    }
++    std::this_thread::sleep_for(jitter + this->drain);
+ 
+     // For some reason using the UP and DOWN gradient of jitter in Marvel
+     // Rivals is causing issues where the expected sign is inverted. This breaks
