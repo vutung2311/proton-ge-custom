@@ -1,6 +1,6 @@
 # Research Notes: Investigation of "Last 3%" Loading Bottleneck in Where Winds Meet (`wwm.exe`)
 
-## Executive Summary (revised 2026-09-29 — read §36 first; §36.1 explains how it was found)
+## Executive Summary (revised 2026-09-30 — read §36 first; §36.1 explains how it was found)
 - **ROOT CAUSE (2026-09-28 17:22, §36).** Wine 11's `mountmgr.sys` answers
   `IOCTL_STORAGE_QUERY_PROPERTY(StorageDeviceTrimProperty)` with `STATUS_NOT_SUPPORTED`;
   GE-Proton10-34's answered `TrimEnabled=1`. Where Winds Meet issues storage property queries during
@@ -15,7 +15,11 @@
   ~190 k/s → ~37 k/s**, with unchanged load time (13.7 / 13.8 s) and frame pacing (100 fps cap).
 - **Frame hitches (2026-09-28, §38).** In-world hitches (frames > 25 ms) appeared only in runs with
   the low-latency layer (Anti-Lag 2) on, on either build; the TRIM fix did not change frame timing.
-  The layer is still on in Lutris entry 11; a layer-off retest is pending.
+- **Low-latency layer (2026-09-29/30, §39).** The layer can be driven for this game now (vkd3d-proton
+  `VKD3D_FORCE_LOW_LATENCY`, Wine patch 0008 for the crash it exposed), but in two layer off/on pairs
+  it raised Present-to-completion latency from 29.3 to 34.7 ms at an unchanged 100 fps. Keep it off.
+  The harness now runs the game on Wayland (§39.4), and controller chords reach the game as the pad
+  sends them (§39.5).
 - **The core problem, measured end to end.** A teleport load (Enter pressed at teleport start → Enter pressed when the loading overlay is gone and the world renders) takes **8.9–18.0 s on GE-Proton10-34** and **47.0–64.4 s on every GE-Proton 11 build tested before the §36 fix** (Valve-based custom, GE-based custom). Same Lutris environment, same prefix, same machine, no memory pressure. Full run table in §34.1.
 - **The regression is not in d3d12/vkd3d-proton, not in the job system and not in the completion-port layer.** vkd3d-proton's own queue timeline (§34.4) shows the renderer running *faster* on 11, uploads executing in the same 115 µs, and no pipeline compiles. The job system's IOCP task rate per second is the same on 10 and 11 (§34.3); its larger totals on 11 only reflect a longer load.
 - **Superseded lead (see §36): a lost wakeup in the asset-streaming path.** On GE-Proton 11 the streamer submits one GPU upload per timer tick on a strict **+600.1 ms / +999.9 ms** cadence (±0.1 ms) for ~36 s between two upload bursts. GE-Proton10-34 shows no such cadence. The streaming thread therefore only advances when a 600 ms or 1000 ms timed wait expires; the signal that should end those waits early does not arrive. Which wait primitive loses the wake is the open question (§34.6).
@@ -3657,6 +3661,8 @@ differences in every A/B run.
 
 **Low-latency layer and frame hitches.** `LOW_LATENCY_LAYER=1` (AMD Anti-Lag 2 on this card;
 `LOW_LATENCY_LAYER_REFLEX` is NVIDIA-only and was removed) was switched on at ~18:28 on 2026-09-28.
+*(Correction, §39.1: `LOW_LATENCY_LAYER_REFLEX` is not NVIDIA-only. It makes the layer offer
+`VK_NV_low_latency2` instead of `VK_AMD_anti_lag`, on any GPU.)*
 In-world frame timing of the hands-free runs that day (standing at the spawn point, 100 fps cap):
 
 | Build / config | Runs | In-world frame timing |
@@ -3697,3 +3703,151 @@ default Proton; `tools/wwm/wwm_ab_run.sh` now refuses such runners.
 - *`docs/walkthrough.md`* (2026-09-12 to 09-28, removed at the rebase) was a session diary of the
   old in-process IOCP work, not maintained documentation; §34.7 lists its refuted claims. It remains
   in `backup/ge-proton11-custom-pre-squash-20260928`.
+
+---
+
+## 39. Low-Latency Layer, Wayland Harness and Controller Input (2026-09-29/30)
+
+### 39.1 Driving the low-latency layer for this game
+
+The game's only latency technology is NVIDIA Reflex through Streamline (`sl.reflex.dll`,
+`slReflexSleep`), which it loads only on NVIDIA GPUs; it has no AMD Anti-Lag 2. On this AMD card
+nothing ever called the layer:
+
+- In its default mode (`LOW_LATENCY_LAYER=1`) the layer offers `VK_AMD_anti_lag`. vkd3d-proton calls
+  it without presentation info, which the layer's Anti-Lag strategy ignores, so it never paces.
+- With `LOW_LATENCY_LAYER_REFLEX=1` it offers `VK_NV_low_latency2` instead. vkd3d-proton registers the
+  swapchain, but the per-frame calls (sleep mode, markers, `LatencySleep`) only come from the game's
+  Reflex integration, which does not run on AMD. The extension was present and idle.
+
+Three changes, all opt-in (commit `12a14049`):
+
+| Change | What it does |
+| :--- | :--- |
+| vkd3d-proton `0005` | `VKD3D_FORCE_LOW_LATENCY=1`: Present makes the calls a Reflex integration would (sleep mode on, PRESENT_START/END with the present count as frame ID, `LatencySleep`, next SIMULATION_START) and tags every present with that frame ID, on every present mode. `VKD3D_FORCE_LOW_LATENCY_FPS` hands the layer a frame cap, applied before the frame starts. |
+| layer `0002` | Read the present ID before calling down, and accept `VkPresentId2KHR` (vkd3d-proton uses it with present-wait 2). |
+| layer `0003` | The delay controller's frame limit and jitter waits spun on `yield()`; they sleep until the deadline now. |
+
+Driving the layer exposed a crash in Wine (commit `2278a5d3`, patch `0008`). On RADV with the layer,
+after the host `vkQueuePresentKHR` returned, the `pNext` of the application's present-ID structure
+pointed into a stack frame that no longer existed, and `win32u_vkQueuePresentKHR` walked the chain
+afterwards to find `VkSwapchainPresentFenceInfoKHR`. The layer's code never writes the chain; which
+component leaves the link behind is not established. The fix looks the fence info up before the host
+call. On a copy of the runner the game then logged in, loaded (14.5 s) and ran 60 s in the world with
+no present crash. Layer `0002` applies the same rule inside the layer.
+
+### 39.2 Result: the layer adds latency here
+
+Two campaigns of hands-free runs, alternating layer off/on, Lutris entry 11, Wayland, 60 s in the
+world (30-90 s after the load started), idle machine:
+
+| Date | Layer | Present → frame complete, p50 | FPS | Frame time p99 | Load |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 09-30 00:55-01:06 (1.12.10) | off ×2 | 29.34 / 29.34 ms | 99.9 | 10.21-10.22 ms | — |
+| | on ×2 | 34.40 / 34.47 ms | 99.9 | 10.24-10.35 ms | — |
+| 09-30 08:48-09:00 (1.12.11) | off ×2 | 29.27 / 29.28 ms | 99.9 | 10.37 / 12.81 ms¹ | — ² / 12.0 s |
+| | on ×2 | 34.67 / 34.67 ms | 99.9 | 10.58 / 11.01 ms | 11.7 / 11.1 s |
+
+¹ A Java build used up to ~10 cores during that run's load. ² Daily login-reward popup covered the HUD.
+
+"Present → frame complete" (`tools/wwm/latency.py`) is the time from the game's
+`IDXGISwapChain::Present` to the completion of that frame's blit on the GPU, from vkd3d-proton's queue
+trace. It covers the queued frames and the GPU, not input sampling or scanout.
+
+The layer's sleep ran once per frame and lasted ~0.01 ms: the GPU had always finished the previous
+frame already, because the game is at its 100 fps cap with the GPU ~49% busy. There is nothing for
+the layer to trim. The 5 ms increase is consistent with vkd3d-proton's own rule
+(`dxgi_vk_swap_chain_wait_internal_handle`): in low-latency mode it stops blocking on its internal
+frame-latency limit once the blit queue is two frames deep and leaves pacing to `LatencySleep`, while
+the layer's sleep only waits for rendering, not for the blit or the display. That reading of the code
+was not verified separately.
+
+**Where the 29 ms comes from.** vkd3d-proton lets the game run up to 3 frames ahead of completed
+blits (`DEFAULT_FRAME_LATENCY`; with immediate present and no present waits the limit is released
+when the blit completes, and the blit also waits for a free swapchain image). The measured ~2.9 frames
+means that budget is full. `VKD3D_SWAPCHAIN_LATENCY_FRAMES=1` would cap it at one frame and remove at
+most ~20 ms (two frames at 100 fps), at a possible cost in frame rate or pacing. It was not measured:
+set against a human visual reaction of ~150-250 ms, the gain is small, and raising the in-game cap
+from 100 to ~157 fps (165 Hz panel with VRR, GPU at ~49%) shortens every per-frame stage by ~36% as
+well. Both are left to the player.
+
+**Runner manifest.** Three manifests registered the same layer name with the same
+`LOW_LATENCY_LAYER` switch: the runner's, `/usr/share` (an unpackaged 24 June build in `/usr/lib`) and
+`~/.local/share` (pointing at `build/`). Under umu the Steam Runtime container lists the host's layers
+ahead of the runner's, so the game loaded the `build/` copy; after a clean build that deletes
+`build/`, it would have fallen back to the June copy. The host copies were removed, and
+`build_runner.sh` now points the runner's manifest at its own library by a path relative to the
+manifest (a bare file name resolves through the library search path) and fails the build if it does
+not resolve. The harness checks that `LOW_LATENCY_LAYER=1` loaded exactly one copy, the runner's. Wine
+sets the Windows environment with `setenv` after exec, so the check reads the switch from the launch
+chain, not from the game's `/proc/<pid>/environ`.
+
+### 39.3 Login stalls on Wine's X11 driver, and a busy machine
+
+From 23:36 on 2026-09-29 every hands-free launch hung at the login dialog, on the new runner and on a
+copy of the previous one. Two separate causes:
+
+- *CPU contention.* A Gradle daemon using ~14 cores slowed the game to 5 fps (197 ms frames) and the
+  login dialog ignored clicks. The harness now refuses to launch when the machine is over 25% busy
+  (`ALLOW_BUSY=1`, `BUSY_MAX`).
+- *X11 path, intermittent.* On an idle machine the game stopped presenting ~17 s after start;
+  plasmashell then ran at ~200% CPU for ~50 s and wineserver at ~100% afterwards, taking turns;
+  KWin logged `BadWindow` errors from `SHAPE` queries on vanished X11 windows. Plasmashell still
+  answered D-Bus and the clipboard was not owned by the game, so neither the notification loop below
+  nor a clipboard fight. Not investigated further: the same launches on Wine's Wayland driver never
+  stalled, and normal play uses Wayland.
+
+Earlier the same day, every game launch froze plasmashell: Plasma 6.7.5's Do Not Disturb applet turns
+itself on for fullscreen windows, its `onInhibitedChanged` handler saves the notification settings,
+and the settings watcher reloads them, which fires the handler again. Setting
+`plasmanotifyrc [DoNotDisturb] WhenFullscreen=false` stopped it (verified in three launches).
+
+Ruled out along the way: the game's pipeline cache (`LocalData/Cache/LocalPSO`, 644 MB, rebuilt
+identically within seconds and still stalled), a game update, and entry 11's configuration.
+
+### 39.4 Harness on Wayland (commit `95a25713`)
+
+Runs now use Wine's Wayland driver by default (`DISPLAY_DRIVER=x11` for the old path). On Wayland one
+client cannot read another's window, so `tools/wwm/wwm_kwin_grab` asks KWin's `ScreenShot2` D-Bus
+interface for the game window's own contents (~17 ms at 2560×1440, covered or not, no focus change).
+KWin grants that interface only to executables named in a `.desktop` file with
+`X-KDE-DBUS-Restricted-Interfaces`; `setup_wayland_capture.sh` authorizes that one binary. Clicks are
+unchanged: `wwm_click.exe` posts window messages inside Wine, which never reach the compositor.
+
+OCR accuracy was the weak link, not capture. On recorded frames the old HUD-label rule recognized
+the world in 0-96% of world frames depending on the scene. Tesseract's English model plus a small
+bottom-left box for the chat hint ("Enter" + player id) recognized 90% of world frames on lossy saved
+frames (Vietnamese model: 87%, and 155 vs 94 ms a read), 44 of 44 live, and never fired on 62 loading
+frames. `world_visible` needs a loading-bar-gone frame confirmed by a later world frame, so a single
+misread only delays confirmation.
+
+Also new: Log In is retried for up to `AUTO_LOGIN_SECS` (240 s); a stuck run's thread states are
+recorded from `/proc` before the game is closed; `NOLL=1` also turns off the forced low-latency mode;
+`frametimes.py` and `latency.py` take `--anchor teleport` for runs without screen checks.
+
+### 39.5 Controller input: chords reach the game as the pad sends them
+
+The pad is a Flydigi Vader 5 Pro (`37d7:2401`), read by Wine through the kernel's Xbox pad device and
+SDL (`PROTON_PREFER_SDL=1`). Two facts about Wine's delivery:
+
+- `winebus.sys`'s SDL backend queues one HID report per SDL button event (`bus_sdl.c:909-910`), so one
+  physical update with LB and RB becomes "LB alone", then "LB+RB". Its evdev backend instead reports
+  once per `SYN_REPORT` (`bus_udev.c:990`), one report per physical update.
+- Wine's XInput updates its state from every report (`xinput1_3/main.c:895`).
+
+Recording the pad itself (evdev, read-only) showed that manual LB+RB presses never arrived in one
+update: the second button followed 3-42 ms later (median 19 ms, RB first in 35 of 40), then both were
+held together ~84 ms. The game reads the pad through its own statically linked SDL2 (2.28-2.30 era)
+and hands per-button events to its scripts, so it sees two separate button events whether or not Wine
+splits the report — as it would on Windows. No Wine change can alter how the game combines them;
+whether a chord is accepted is decided by the game's own rules. The SDL coalescing patch considered
+for `bus_sdl.c` was dropped, and `PROTON_PREFER_SDL` stays on.
+
+### 39.6 Housekeeping
+
+Removed after these results: the debug runner `GE-Proton11-custom-dbg` (2.1 GB), the pre-test copy of
+the pipeline cache (619 MB) and the moved host copies of the layer.
+
+`docs/walkthrough.md` is back, as a different document from the diary retired in §38: a short
+practical guide to building the runner, configuring the game and running the harness, pointing here
+for the evidence.
