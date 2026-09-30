@@ -771,6 +771,9 @@ fi
     echo "WINE: -CUSTOM- ntdll: serve same-process completion-port traffic in-process"
     apply_patch "../patches/wine-hotfixes/pending/0007-ntdll-in-process-completion-ports.patch"
 
+    echo "WINE: -CUSTOM- win32u: find the present fence info before the host present"
+    apply_patch "../patches/wine-hotfixes/pending/0008-win32u-find-present-fence-before-host-present.patch"
+
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"

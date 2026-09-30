@@ -1,0 +1,49 @@
+From: XProtocol Bot
+Subject: [PATCH] win32u: Find the present fence info before the host present.
+
+win32u_vkQueuePresentKHR looked for VkSwapchainPresentFenceInfoKHR by walking the
+present chain after the host vkQueuePresentKHR returned. With a present ID in the
+chain (VkPresentIdKHR or VkPresentId2KHR, used by vkd3d-proton when the
+VK_NV_low_latency2 path is active), the chain came back from the host call with
+the present-ID structure's pNext pointing into a stack frame below Wine that had
+already returned (seen on RADV with the low-latency layer, whose code does not
+write the chain); the walk then followed that dangling link and faulted on the
+first present (Where Winds Meet, layer in VK_NV_low_latency2 mode). Look the
+structure up before the host call, so the chain is never read after the driver
+and layers have had it.
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -6325,6 +6325,17 @@
+         present_info->pWaitSemaphores = &blit_sema;
+     }
+ 
++    /* Managed swapchains have no host present to signal these fences. Look the fence info up
++     * before the host present: a driver or layer may splice its own stack structure into the
++     * chain during the call and leave a dangling link behind (seen on RADV
++     * with a present ID), so the chain must not be walked after it. */
++    for (const VkBaseInStructure *header = present_info->pNext; header; header = header->pNext)
++        if (header->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR)
++        {
++            present_fence_info = (const VkSwapchainPresentFenceInfoKHR *)header;
++            break;
++        }
++
+     res = VK_SUCCESS;
+     /* Host present consumes waits for host swapchains. */
+     if (host_count)
+@@ -6370,14 +6381,6 @@
+         }
+     }
+ 
+-    /* Managed swapchains have no host present to signal these fences. */
+-    for (const VkBaseInStructure *header = present_info->pNext; header; header = header->pNext)
+-        if (header->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR)
+-        {
+-            present_fence_info = (const VkSwapchainPresentFenceInfoKHR *)header;
+-            break;
+-        }
+-
+     /* All-managed presents consume the live wait array once here. */
+     if (!host_count && present_info->waitSemaphoreCount)
+     {
