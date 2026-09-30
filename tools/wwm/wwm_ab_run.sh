@@ -20,9 +20,12 @@
 #                                            # marks the load start from the game log and quits
 #                                            # AUTO_LOAD_SECS (default 100) later. The load end is
 #                                            # taken from the upload trace (QPROFILE=1 is implied).
+#   AUTO_LOGIN_SECS=240 ...                  # how long AUTO keeps clicking Log In while the game is busy
+#   ALLOW_BUSY=1 ...                         # run even if the machine is busy before launch (BUSY_MAX=25 %)
+#   DISPLAY_DRIVER=x11 ...                   # Wine's X11 driver instead of Wayland (the default)
 #
-# 1. Points the Lutris entry at the runner under test and forces Wine's X11 driver
-#    (PROTON_ENABLE_WAYLAND=0) for the run; the entry is restored on exit.
+# 1. Points the Lutris entry at the runner under test and sets Wine's display driver for the run
+#    (Wayland by default, DISPLAY_DRIVER=x11 for X11); the entry is restored on exit.
 # 2. Starts proton_profiler.py via pkexec with the matching Nt* census script,
 #    or reuses an already-waiting profiler if it uses the same script.
 # 3. Launches the game, records your "teleport started" / "world visible"
@@ -43,7 +46,9 @@ case "${1:-}" in
     p11ce11) game_id=11; yml_glob="where-winds-meet-1[0-9]*.yml";      runner="GE-Proton11-custom" ;;
     # Differential: custom Wine 11 with GE-Proton10-34's dxvk/ and vkd3d-proton/ directories.
     p11cgfx10) game_id=11; yml_glob="where-winds-meet-1[0-9]*.yml";    runner="GE-Proton11-custom-gfx10" ;;
-    *)   echo "usage: $0 p10|p11|p11c|p11ce11|p11cgfx10" >&2; exit 2 ;;
+    # Any test runner (e.g. an instrumented copy) through Lutris entry 11.
+    p11cx) game_id=11; yml_glob="where-winds-meet-1[0-9]*.yml";        runner="${TEST_RUNNER:?p11cx needs TEST_RUNNER=<runner directory name>}" ;;
+    *)   echo "usage: $0 p10|p11|p11c|p11ce11|p11cgfx10|p11cx" >&2; exit 2 ;;
 esac
 label="$1"
 bt="$(realpath -m "${BT:-$TOOLS/nt_census_${runner}.bt}")"
@@ -153,6 +158,26 @@ stop_cpu() {
     fi
     cpu_pid=""
 }
+# Per-thread state, kernel wait channel and name of the game and wineserver, from /proc only
+# (no ptrace: nothing attaches to the game).
+snapshot_threads() {
+    local out="$1" pid t st wc nm
+    {
+        echo "# $(date +%s.%N) tid state wchan name"
+        for pid in $(pgrep -x wwm.exe) $(pgrep -x wineserver); do
+            echo "## pid $pid"
+            for t in "/proc/$pid/task/"*; do
+                # A thread can exit between listing and reading: skip it rather than fail.
+                if st="$(awk '{ print $3 }' "$t/stat" 2>/dev/null)" && wc="$(cat "$t/wchan" 2>/dev/null)" \
+                        && nm="$(cat "$t/comm" 2>/dev/null)"; then
+                    echo "${t##*/} $st $wc $nm"
+                fi
+            done
+        done
+    } >"$out"
+    info "thread snapshot: $out"
+}
+
 on_exit() {
     stop_follower
     stop_recorder
@@ -163,6 +188,12 @@ on_exit() {
             && ! grep -q '^quit_at ' "$markers"; then
         echo "quit_at $(date +%s.%N)" >>"$markers"
         if pgrep -x wwm.exe >/dev/null; then pkill -x wwm.exe; fi
+    elif [ "${AUTO:-0}" = "1" ] && [ -n "${game_launched:-}" ] && pgrep -x wwm.exe >/dev/null; then
+        # A hands-free run that stopped before the load (login not registered, a check failed):
+        # record where the game's threads wait (a stalled login is otherwise undiagnosable), then
+        # close the game it launched instead of leaving it at the login screen.
+        snapshot_threads "${markers%.markers}.threads.txt"
+        pkill -x wwm.exe
     fi
     restore_config
 }
@@ -177,6 +208,22 @@ backup_config_once() {
     fi
 }
 
+# Timings are only comparable on an otherwise idle machine: a background build using most cores
+# slows the game to a few FPS and even makes the login dialog miss clicks. Measure overall CPU
+# use for 3 s before touching anything; ALLOW_BUSY=1 skips the check.
+if [ "${ALLOW_BUSY:-0}" != "1" ]; then
+    read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ </proc/stat
+    sleep 3
+    read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ </proc/stat
+    busy_total=$(( (u2 + n2 + s2 + i2 + w2 + q2 + sq2 + st2) - (u1 + n1 + s1 + i1 + w1 + q1 + sq1 + st1) ))
+    busy_pct=$(( 100 * (busy_total - (i2 - i1) - (w2 - w1)) / busy_total ))
+    if [ "$busy_pct" -gt "${BUSY_MAX:-25}" ]; then
+        top -b -n1 -o %CPU | sed -n '7,12p' >&2
+        die "the machine is ${busy_pct}% busy before launch (limit ${BUSY_MAX:-25}%); the run would not be comparable. Top processes above; ALLOW_BUSY=1 to run anyway"
+    fi
+    info "CPU ${busy_pct}% busy before launch"
+fi
+
 current="$(sed -n 's/^  version: //p' "$yml")"
 [ -n "$current" ] || die "no 'version:' line in $yml"
 if [ "$current" != "$runner" ]; then
@@ -187,19 +234,31 @@ else
     info "Lutris entry $game_id already uses $runner"
 fi
 
-# Every run uses Wine's X11 driver, whatever the entry says for normal play: the screen checks
-# read the game window through X11 (wwm_grab.py) and all recorded measurements are X11-path
-# numbers. PROTON_ENABLE_WAYLAND=0 for this run only, restored on exit like the runner swap.
-if ! grep -qE "^    PROTON_ENABLE_WAYLAND: ['\"]?0['\"]?$" "$yml"; then
+# Display driver for this run, whatever the entry says for normal play (restored on exit like the
+# runner swap): Wayland by default, as the game is played; DISPLAY_DRIVER=x11 for Wine's X11 driver.
+# Screen checks read the game window either way (wwm_grab.py): through XWayland's pixmap on X11,
+# through KWin's ScreenShot2 interface on Wayland (tools/wwm/setup_wayland_capture.sh, once).
+# On the X11 driver, logins intermittently stall with plasmashell and wineserver saturated
+# (seen 2026-09-29/30), so X11 runs are for comparisons with older X11 measurements.
+display_driver="${DISPLAY_DRIVER:-wayland}"
+case "$display_driver" in
+    wayland) want_wayland=1 ;;
+    x11) want_wayland=0 ;;
+    *) die "DISPLAY_DRIVER must be wayland or x11, not '$display_driver'" ;;
+esac
+if [ "$want_wayland" = 1 ] && ! "$TOOLS/setup_wayland_capture.sh" --check; then
+    die "screen checks on Wayland need the KWin capture helper: run tools/wwm/setup_wayland_capture.sh once"
+fi
+if ! grep -qE "^    PROTON_ENABLE_WAYLAND: ['\"]?${want_wayland}['\"]?$" "$yml"; then
     backup_config_once
     sed -i "/^    PROTON_ENABLE_WAYLAND: /d" "$yml"
     grep -q '^    WINEDEBUG: ' "$yml" || die "no WINEDEBUG entry under system.env in $yml"
-    sed -i "/^    WINEDEBUG: /a\\    PROTON_ENABLE_WAYLAND: '0'" "$yml"
-    info "display: X11 forced for this run (temporary config change)"
+    sed -i "/^    WINEDEBUG: /a\\    PROTON_ENABLE_WAYLAND: '${want_wayland}'" "$yml"
+    info "display: $display_driver for this run (temporary config change)"
 else
-    info "display: X11 (the entry already uses it)"
+    info "display: $display_driver (the entry already uses it)"
 fi
-echo "display_driver x11" >>"$markers"
+echo "display_driver $display_driver" >>"$markers"
 
 # PROTONLOG=1: Proton log with exception/loader channels, written into telemetry/.
 # The Lutris config sets WINEDEBUG=-all and Lutris runs as a persistent app, so the
@@ -222,16 +281,15 @@ if [ "${PROTONLOG:-0}" = "1" ]; then
     info "PROTONLOG=1: Proton log -> $protonlog_dir (temporary config change)"
 fi
 
-# NOLL=1: turn the KORTHOS low-latency layer (and its Reflex emulation) off for this run,
-# the way Lutris entry 11 has it. With GE-based Wine, whose winevulkan supports
-# VK_NV_low_latency2, the layer + Reflex made the game abort at startup.
+# NOLL=1: turn the KORTHOS low-latency layer, its VK_NV_low_latency2 mode and vkd3d-proton's
+# forced low-latency calls off for this run (the baseline for layer on/off comparisons).
 if [ "${NOLL:-0}" = "1" ]; then
     backup_config_once
-    for var in LOW_LATENCY_LAYER LOW_LATENCY_LAYER_REFLEX DISABLE_LOW_LATENCY_LAYER; do
+    for var in LOW_LATENCY_LAYER LOW_LATENCY_LAYER_REFLEX DISABLE_LOW_LATENCY_LAYER VKD3D_FORCE_LOW_LATENCY; do
         sed -i "/^    ${var}: /d" "$yml"
     done
     grep -q '^    WINEDEBUG: ' "$yml" || die "no WINEDEBUG entry under system.env in $yml"
-    sed -i "/^    WINEDEBUG: /a\\    LOW_LATENCY_LAYER: '0'\\n    LOW_LATENCY_LAYER_REFLEX: '0'\\n    DISABLE_LOW_LATENCY_LAYER: '1'" "$yml"
+    sed -i "/^    WINEDEBUG: /a\\    LOW_LATENCY_LAYER: '0'\\n    LOW_LATENCY_LAYER_REFLEX: '0'\\n    DISABLE_LOW_LATENCY_LAYER: '1'\\n    VKD3D_FORCE_LOW_LATENCY: '0'" "$yml"
     info "NOLL=1: low-latency layer off for this run (temporary config change)"
 fi
 
@@ -312,7 +370,7 @@ echo "mem_available_mb_start $mem_avail_mb" >>"$markers"
 echo "mem_psi_avg10_start $mem_psi" >>"$markers"
 game_exe="$(readlink "/proc/$(pgrep -xo wwm.exe)/exe")"
 case "$game_exe" in
-    "$RUNNERS/$runner/"*) info "wwm.exe is running under $runner" ;;
+    "$RUNNERS/$runner/"*) info "wwm.exe is running under $runner"; game_launched=1 ;;
     *)  pkill -x wwm.exe
         die "wwm.exe started under the wrong runner ($game_exe); game stopped" ;;
 esac
@@ -370,6 +428,30 @@ login_dialog_up() {
     WINEPREFIX="$HOME/.wine" WINEDEBUG=-all "$RUNNERS/$runner/files/bin/wine" "$TOOLS/wwm_windows.exe" 2>/dev/null \
         | grep -q MPAY_SWITCH_ACCOUNT
 }
+# "Log In" in the NetEase dialog. The game ignores it while it is busy behind the dialog:
+# compiling and saving its pipeline cache after a runner change stops it for well over a minute.
+# So click every ~10 s until the game logs the login, the dialog closes (a late click was taken:
+# give the login time to show up, never click again), or AUTO_LOGIN_SECS (default 240) pass.
+# Prints the game log line number of the login.
+login_until() {
+    local deadline n attempt=0
+    deadline=$(( $(date +%s) + ${AUTO_LOGIN_SECS:-240} ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        attempt=$((attempt + 1))
+        if ! wine_click --class MPAY_SWITCH_ACCOUNT --post 0.5000 0.6660; then
+            info "AUTO: posting Log In failed (attempt $attempt)" >&2
+        fi
+        if n="$(wait_log 'on_redis_get_account_back' 0 10)"; then echo "$n"; return 0; fi
+        pgrep -x wwm.exe >/dev/null || return 1
+        if ! login_dialog_up; then
+            if n="$(wait_log 'on_redis_get_account_back' 0 30)"; then echo "$n"; return 0; fi
+            info "AUTO: the login dialog closed but the game logged no login" >&2
+            return 1
+        fi
+        info "AUTO: Log In not registered yet (attempt $attempt)" >&2
+    done
+    return 1
+}
 # Latest state the screen recorder saw (world, loading, already_online, disconnect, ...).
 screen_state() { if [ -f "$framedir/states.tsv" ]; then tail -n 1 "$framedir/states.tsv" | cut -f2; fi; }
 # Did the recorder see state $1 at or after epoch $2?
@@ -422,6 +504,46 @@ click_label_until() {
     return 1
 }
 
+# LOW_LATENCY_LAYER=1 must load the layer shipped in the runner under test. Other manifests with
+# the same layer name and switch can exist (/usr/share, ~/.local/share/vulkan), and the runner's
+# manifest names the library without a path, so check what the game actually mapped. Recorded as
+# "low_latency_layer <path>|none"; a wrong or duplicate copy stops the run. Called while the game
+# renders the world, so its Vulkan device exists.
+check_low_latency_layer() {
+    local pid p env want maps libs n rdir
+    pid="$(pgrep -xo wwm.exe)" || { info "low-latency layer check skipped: the game is not running"; return 0; }
+    maps="$(cat "/proc/$pid/maps")"
+    # Wine sets the Windows environment with setenv after exec, so the game's /proc environ
+    # lacks it: take the switch from the nearest ancestor that has it (umu/pressure-vessel or
+    # Proton). Read into variables first: grep -q closing a pipe early would fail under pipefail.
+    want=0
+    p="$pid"
+    while [ "$p" -gt 1 ]; do
+        env="$(tr '\0' '\n' <"/proc/$p/environ")"
+        if grep -q '^LOW_LATENCY_LAYER=' <<<"$env"; then
+            if grep -qx 'LOW_LATENCY_LAYER=1' <<<"$env" && ! grep -qx 'DISABLE_LOW_LATENCY_LAYER=1' <<<"$env"; then
+                want=1
+            fi
+            break
+        fi
+        p="$(awk '{ print $4 }' "/proc/$p/stat")"
+    done
+    libs="$(awk '$6 ~ /libVkLayer_KORTHOS_LowLatency\.so$/ { print $6 }' <<<"$maps" | sort -u)"
+    n=0
+    if [ -n "$libs" ]; then n="$(wc -l <<<"$libs")"; fi
+    echo "low_latency_layer $(tr '\n' ' ' <<<"${libs:-none}")" >>"$markers"
+    rdir="$(realpath "$RUNNERS/$runner")"
+    if [ "$want" = 1 ]; then
+        [ "$n" = 1 ] || { pkill -x wwm.exe; die "LOW_LATENCY_LAYER=1 but $n copies of the layer are loaded: ${libs:-none} (game stopped)"; }
+        case "$libs" in
+            "$rdir/"*) info "low-latency layer loaded from the runner: $libs" ;;
+            *) pkill -x wwm.exe; die "LOW_LATENCY_LAYER=1 loaded $libs, not the copy in $rdir (game stopped)" ;;
+        esac
+    elif [ "$n" != 0 ]; then
+        pkill -x wwm.exe; die "the low-latency layer is loaded without LOW_LATENCY_LAYER=1: $libs (game stopped)"
+    fi
+}
+
 echo
 if [ "${AUTO:-0}" = "1" ]; then
     info "AUTO: waiting for the NetEase login dialog"
@@ -431,18 +553,22 @@ if [ "${AUTO:-0}" = "1" ]; then
         sleep 2
     done
     login_dialog_up || die "no login dialog (MPAY_SWITCH_ACCOUNT) within 300 s"
-    # A window exists now, so the display driver is loaded: it must be X11 (see above).
+    # A window exists now, so the display driver is loaded: it must be the one asked for.
     game_maps="/proc/$(pgrep -xo wwm.exe)/maps"
-    if grep -q 'winewayland' "$game_maps" || ! grep -q 'winex11' "$game_maps"; then
+    if [ "$want_wayland" = 1 ]; then
+        driver_ok=0; if grep -q 'winewayland' "$game_maps"; then driver_ok=1; fi
+    else
+        driver_ok=1; if grep -q 'winewayland' "$game_maps" || ! grep -q 'winex11' "$game_maps"; then driver_ok=0; fi
+    fi
+    if [ "$driver_ok" != 1 ]; then
         pkill -x wwm.exe
-        die "the game is not on Wine's X11 driver; screen checks cannot read it (game stopped)"
+        die "the game is not on Wine's $display_driver driver (game stopped)"
     fi
     sleep "${AUTO_CLICK_DELAY:-2}"
-    # "Log In" in the dialog: posted to the dialog window, which handles it without focus. The
+    # "Log In" in the dialog (login_until): posted to the dialog window, which handles it without focus. The
     # dialog is a separate fixed-size window (360x380), so its fraction does not depend on the
     # game's resolution.
-    ln="$(click_until 0 'on_redis_get_account_back' 'Log In' --class MPAY_SWITCH_ACCOUNT --post 0.5000 0.6660)" || \
-        die "the game did not register the Log In click (see $gamelog)"
+    ln="$(login_until)" || die "the game did not register the Log In click within ${AUTO_LOGIN_SECS:-240} s (see $gamelog)"
     echo "login_clicked $(log_time "$ln")" >>"$markers"
     sleep "${AUTO_CLICK_DELAY:-4}"
     # "Resume" (where "Start" was): the game ignores input while it thinks it is inactive, so post
@@ -488,6 +614,7 @@ if [ "${AUTO:-0}" = "1" ]; then
         fi
         sleep 1
     done
+    check_low_latency_layer
     echo "quit_at $(date +%s.%N)" >>"$markers"
 elif wait_enter "Log in. Press Enter at the moment you START the teleport... "; then
     echo "teleport_start $(date +%s.%N)" >>"$markers"

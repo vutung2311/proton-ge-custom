@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=WWM harness window capture
+Comment=Lets tools/wwm/wwm_kwin_grab capture one window through KWin's ScreenShot2 interface
+Exec=@WWM_KWIN_GRAB@
+NoDisplay=true
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

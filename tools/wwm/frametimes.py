@@ -4,7 +4,8 @@
 usage: tools/wwm/frametimes.py [--from 5] [--to 40] telemetry/abrun_<run> [...]
 
 For each run: the present timestamps ("PRESENT (id = N)" events on the IDXGISwapChain::Present() lane) in the
-window from --from to --to seconds after world_visible (the screen-measured world HUD), and
+window from --from to --to seconds after world_visible (the screen-measured world HUD; with
+--anchor teleport, after teleport_start from the game log, for runs without screen checks), and
 from them the frame rate, median / 95th / 99th percentile frame time, the worst frame, and the
 number of frames longer than 25 ms and 50 ms. Trace time is anchored to wall time as in
 vkd3d_qprof.py (the game is killed at quit_at, so the trace's last event ~= quit_at).
@@ -15,6 +16,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument('runs', nargs='+')
 ap.add_argument('--from', dest='t_from', type=float, default=5.0)
 ap.add_argument('--to', dest='t_to', type=float, default=40.0)
+ap.add_argument('--anchor', choices=('world', 'teleport'), default='world',
+                help='window start: world_visible (screen, X11 runs) or teleport_start (game log; also Wayland runs)')
 a = ap.parse_args()
 
 
@@ -29,13 +32,14 @@ def markers(path):
     return m
 
 
-print(f"{'run':34s} {'fps':>6s} {'p50':>6s} {'p95':>6s} {'p99':>6s} {'max':>7s} {'>25ms':>6s} {'>50ms':>6s}  (ms, window world+{a.t_from:g}..+{a.t_to:g}s)")
+print(f"{'run':34s} {'fps':>6s} {'p50':>6s} {'p95':>6s} {'p99':>6s} {'max':>7s} {'>25ms':>6s} {'>50ms':>6s}  (ms, window {a.anchor}+{a.t_from:g}..+{a.t_to:g}s)")
 for run in a.runs:
     base = os.path.basename(run)[len('abrun_'):]
     trace = os.path.join(os.path.dirname(run), f'vkd3d_queue_{base}.json')
     m = markers(run + '.markers')
-    if 'world_visible' not in m or not os.path.exists(trace):
-        print(f'{base:34s} (no world_visible marker or no trace)')
+    key = 'world_visible' if a.anchor == 'world' else 'teleport_start'
+    if key not in m or not os.path.exists(trace):
+        print(f'{base:34s} (no {key} marker or no trace)')
         continue
     ev = []
     last = 0.0
@@ -56,7 +60,7 @@ for run in a.runs:
         print(f'{base:34s} (no quit_at)')
         continue
     off = anchor - last
-    lo, hi = m['world_visible'] + a.t_from, m['world_visible'] + a.t_to
+    lo, hi = m[key] + a.t_from, m[key] + a.t_to
     ts = sorted(t + off for t in ev if lo <= t + off <= hi)
     if len(ts) < 10:
         print(f'{base:34s} (only {len(ts)} presents in window)')

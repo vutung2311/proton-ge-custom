@@ -26,13 +26,14 @@ Regions are fractions of the client area, measured on 2560x1440 frames.
 import argparse, io, os, re, signal, subprocess, sys, time, unicodedata
 from PIL import Image, ImageOps
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wwm_grab import Grabber, NotFound, NotViewable
+from wwm_grab import Grabber, NotFound, NotViewable, Unavailable
 
 REGIONS = {
     'hud': (0.80, 0.38, 1.00, 0.56),      # right-side labels: Summon Mount / Appearance / Hide UI / Photo
     'center': (0.25, 0.30, 0.75, 0.70),   # modal dialogs
     'bottom': (0.00, 0.85, 1.00, 1.00),   # loading progress, chat hint, player id
     'progress': (0.40, 0.925, 0.60, 0.975),  # just the "Loading Data... NN%" line (0.12 s to read)
+    'hint': (0.00, 0.93, 0.22, 1.00),     # bottom-left: chat hint "Enter" + player id (world only)
 }
 # Right-side HUD labels, each matched by any of its fragments (OCR drops or garbles letters:
 # "Appearan", "hoto", "peara"); two different labels mean the world HUD is up.
@@ -48,13 +49,28 @@ PERCENT = re.compile(r'(\d{1,3})\s?%')
 OCR_ENV = dict(os.environ, OMP_THREAD_LIMIT='1')   # one core: do not compete with the game
 
 
+def ocr_lang():
+    # The game's UI is English: tesseract's English model reads it better and faster than the
+    # Vietnamese one (world chat hint 90% vs 87% of recorded world frames, 94 vs 155 ms a read,
+    # no false world on loading frames with either). The Vietnamese model, the one installed
+    # before, is the fallback; WWM_OCR_LANG overrides.
+    if os.environ.get('WWM_OCR_LANG'):
+        return os.environ['WWM_OCR_LANG']
+    r = subprocess.run(['tesseract', '--list-langs'], capture_output=True, text=True, check=True)
+    langs = set(r.stdout.split())
+    return 'eng' if 'eng' in langs else 'vie'
+
+
+OCR_LANG = ocr_lang()
+
+
 def ocr(im, region):
     w, h = im.size
     x0, y0, x1, y1 = REGIONS[region]
     crop = ImageOps.grayscale(im.crop((int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))))
     buf = io.BytesIO()
     crop.save(buf, 'PNG')
-    r = subprocess.run(['tesseract', 'stdin', 'stdout', '-l', 'vie', '--psm', '11'], input=buf.getvalue(),
+    r = subprocess.run(['tesseract', 'stdin', 'stdout', '-l', OCR_LANG, '--psm', '11'], input=buf.getvalue(),
                        capture_output=True, env=OCR_ENV, check=True)
     return ' '.join(r.stdout.decode('utf-8', 'replace').split())
 
@@ -78,6 +94,13 @@ def classify(texts):
     # dark scenes, bright sky garbles it while "Appearance F5" survives
     if sum(any(w in hud for w in label) for label in HUD_LABELS) >= 2 or 'deuif6' in hud or 'rancef5' in hud:
         return 'world'
+    # the chat hint "Enter" followed by the player id sits bottom-left only in the world (the
+    # loading screen shows the id alone); read on bright scenes where the HUD labels are not.
+    # The small 'hint' box reads it far more reliably than the whole bottom band, where scenery
+    # between "Enter" and the id breaks "nterid" (checked against recorded X11 and Wayland runs:
+    # same world time as the HUD labels, never during loading).
+    if 'nterid' in n.get('bottom', '') or 'nter' in n.get('hint', ''):
+        return 'world'
     # only the progress bar region: the bottom band's player id and FPS overlay OCR into stray "N %"
     if PERCENT.search(texts.get('progress', '')):
         return 'loading'
@@ -93,6 +116,9 @@ def cmd_state(_):
     except NotViewable:
         print('unviewable |')
         return 4
+    except Unavailable as e:
+        print(f'capture unavailable: {e}', file=sys.stderr)
+        return 5
     texts = {r: ocr(im, r) for r in REGIONS}
     print(f"{classify(texts)} | " + ' || '.join(f'{r}: {t}' for r, t in texts.items()))
     return 0
@@ -103,7 +129,11 @@ def cmd_record(a):
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
-    g = Grabber()
+    try:
+        g = Grabber()
+    except Unavailable as e:
+        print(f'capture unavailable: {e}', file=sys.stderr)
+        return 5
     missing_since = None
     seen = False          # "gone" only counts once the window has existed (the launcher has none)
     started = time.time()
@@ -129,9 +159,12 @@ def cmd_record(a):
                 out.write(f'{t:.3f}\tunviewable\t\n')
                 time.sleep(a.interval)
                 continue
+            except Unavailable as e:
+                print(f'capture unavailable: {e}', file=sys.stderr)
+                return 5
             # Every frame reads the HUD and the loading percentage; the dialog and bottom bands are
             # read every third frame.
-            texts = {'hud': ocr(im, 'hud'), 'progress': ocr(im, 'progress')}
+            texts = {'hud': ocr(im, 'hud'), 'progress': ocr(im, 'progress'), 'hint': ocr(im, 'hint')}
             if i % 3 == 0:
                 texts['center'] = ocr(im, 'center')
                 texts['bottom'] = ocr(im, 'bottom')
@@ -184,31 +217,25 @@ def cmd_scan(a):
     rows.sort()
     t0 = a.teleport_start
     after = [r for r in rows if r[0] >= t0]
-    # confirmed HUD: the first HUD frame after which the loading overlay does not come back for
-    # --settle seconds and the HUD is read at least once more (OCR misses the HUD on some frames,
-    # so consecutive-frame rules are too strict).
-    wv = None
-    for k, (t, s, _) in enumerate(after):
-        if s != 'world':
-            continue
-        nxt = [r for r in after[k + 1:] if r[0] - t <= a.settle]
-        if any(r[1] == 'loading' for r in nxt):
-            continue
-        if any(r[1] == 'world' for r in nxt):
-            wv = t
-            break
-    # The loading bar OCRs reliably, the HUD labels do not (dark scenes): report the first frame
-    # after the last loading-bar frame before the confirmed HUD, when only world/unknown frames
-    # lie in between. Frames are one interval apart, so the overlay went away at most one
-    # interval before that frame.
+    # world_visible: the first frame after the last loading-bar frame, once the loading bar never
+    # returns and the world HUD is read at least once afterwards. The loading bar OCRs reliably;
+    # the HUD labels do not (dark or bright scenes read as "unknown" for many seconds), so the HUD
+    # only confirms the world, it does not time it. Frames are one interval apart, so the overlay
+    # went away at most one interval before the reported frame.
+    wv = wv_hud = None
+    loading_idx = [k for k, r in enumerate(after) if r[1] == 'loading']
+    world_idx = [k for k, r in enumerate(after) if r[1] == 'world']
+    if loading_idx:
+        last_loading = loading_idx[-1]
+        hud_after = [k for k in world_idx if k > last_loading]
+        between = after[last_loading + 1:hud_after[0]] if hud_after else []
+        if hud_after and all(r[1] in ('world', 'unknown') for r in between):
+            wv, wv_hud = after[last_loading + 1][0], after[hud_after[0]][0]
+    elif world_idx:
+        wv = wv_hud = after[world_idx[0]][0]   # no loading bar seen: time by the HUD
     if wv is not None:
-        before = [r for r in after if r[0] <= wv]
-        last_loading = max((k for k, r in enumerate(before) if r[1] == 'loading'), default=None)
-        wv_overlay = wv
-        if last_loading is not None and all(r[1] in ('world', 'unknown') for r in before[last_loading + 1:]):
-            wv_overlay = before[last_loading + 1][0]
-        print(f'world_visible {wv_overlay:.3f}')
-        print(f'world_hud {wv:.3f}')
+        print(f'world_visible {wv:.3f}')
+        print(f'world_hud {wv_hud:.3f}')
     else:
         print('world_visible none')
     seen = {}
@@ -235,7 +262,7 @@ def ocr_words(img, psm, may_crash=False):
     for such a crop return None instead of raising, so one unreadable line does not end a search."""
     buf = io.BytesIO()
     img.save(buf, 'PNG')
-    r = subprocess.run(['tesseract', 'stdin', 'stdout', '-l', 'vie', '--psm', str(psm), 'tsv'],
+    r = subprocess.run(['tesseract', 'stdin', 'stdout', '-l', OCR_LANG, '--psm', str(psm), 'tsv'],
                        input=buf.getvalue(), capture_output=True, env=OCR_ENV)
     if r.returncode != 0:
         if may_crash and r.returncode < 0:
@@ -314,6 +341,9 @@ def cmd_locate(a):
         except NotViewable:
             print('unviewable', file=sys.stderr)
             return 4
+        except Unavailable as e:
+            print(f'capture unavailable: {e}', file=sys.stderr)
+            return 5
     found = find_label(im, a.label, a.min_conf, a.pick)
     if not found:
         print(f'label {a.label!r} not found', file=sys.stderr)

@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Capture the Where Winds Meet window's own contents without touching the desktop: no input, no
-focus or stacking change. XWayland redirects every top-level window to an off-screen pixmap
-(Composite), so the pixmap holds the game's last presented frame even when other windows cover it.
-A minimized (unmapped) window has no pixmap.
+focus or stacking change, whether the game runs on Wine's X11 or Wayland driver.
+
+X11 driver: XWayland redirects every top-level window to an off-screen pixmap (Composite), so the
+pixmap holds the game's last presented frame even when other windows cover it. A minimized
+(unmapped) window has no pixmap.
+Wayland driver: the window is not an X11 window; KWin captures it through its ScreenShot2 D-Bus
+interface (tools/wwm/wwm_kwin_grab, authorized by tools/wwm/setup_wayland_capture.sh). That too is
+the window's own contents, covered or not.
 
   tools/wwm/wwm_grab.py out.png [--title "Where Winds Meet"]
-Exit codes: 0 captured, 3 window not found, 4 window not viewable (minimized or unmapped).
+Exit codes: 0 captured, 3 window not found, 4 window not viewable, 5 capture unavailable.
 
-As a module: Grabber(title).grab() returns a PIL RGB image, or raises NotFound / NotViewable.
+As a module: Grabber(title).grab() returns a PIL RGB image, or raises NotFound / NotViewable /
+Unavailable.
 """
-import argparse, sys
+import argparse, io, os, subprocess, sys
 from Xlib import X, display
 from Xlib.error import BadDrawable, BadMatch, BadWindow
 from Xlib.ext import composite
@@ -24,7 +30,57 @@ class NotViewable(Exception):
     pass
 
 
+class Unavailable(Exception):
+    """Capture cannot work at all (e.g. the KWin helper is missing or not authorized)."""
+
+
+class KWinGrabber:
+    HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wwm_kwin_grab')
+
+    def __init__(self, title):
+        self.title = title
+
+    @classmethod
+    def available(cls):
+        return bool(os.environ.get('WAYLAND_DISPLAY')) and os.access(cls.HELPER, os.X_OK)
+
+    def grab(self):
+        try:
+            r = subprocess.run([self.HELPER, self.title], capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            raise NotViewable(f'{self.title}: KWin capture timed out')
+        if r.returncode == 0:
+            return Image.open(io.BytesIO(r.stdout)).convert('RGB')
+        err = r.stderr.decode('utf-8', 'replace').strip()
+        if r.returncode == 3:
+            raise NotFound(self.title)
+        if r.returncode in (5, 6):
+            raise Unavailable(f'{err} (run tools/wwm/setup_wayland_capture.sh)' if r.returncode == 5 else err)
+        # The window went away between lookup and capture, or a D-Bus hiccup: try again later.
+        raise NotViewable(f'{self.title}: {err}')
+
+
 class Grabber:
+    """X11 window first (the game on Wine's X11 driver); otherwise, in a Wayland session, KWin."""
+
+    def __init__(self, title='Where Winds Meet'):
+        self.title = title
+        self.x11 = X11Grabber(title) if os.environ.get('DISPLAY') else None
+        self.kwin = KWinGrabber(title) if KWinGrabber.available() else None
+        if not self.x11 and not self.kwin:
+            raise Unavailable('neither an X server nor the KWin capture helper is available')
+
+    def grab(self):
+        if self.x11:
+            try:
+                return self.x11.grab()
+            except NotFound:
+                if not self.kwin:
+                    raise
+        return self.kwin.grab()
+
+
+class X11Grabber:
     def __init__(self, title='Where Winds Meet'):
         self.title = title
         self.d = display.Display()
@@ -99,9 +155,12 @@ def main():
     except NotFound:
         print(f'window "{a.title}" not found', file=sys.stderr)
         return 3
-    except NotViewable:
-        print(f'window "{a.title}" is not viewable (minimized or unmapped)', file=sys.stderr)
+    except NotViewable as e:
+        print(f'window "{a.title}" is not viewable: {e}', file=sys.stderr)
         return 4
+    except Unavailable as e:
+        print(f'capture unavailable: {e}', file=sys.stderr)
+        return 5
     im.save(a.out)
     print(f'{a.out}: {im.width}x{im.height}')
     return 0

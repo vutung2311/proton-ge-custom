@@ -1,5 +1,6 @@
 # built from the .c sources by wwm_ab_run.sh
 *.exe
+wwm_kwin_grab
 # generated bpftrace scripts (gen_nt_census.sh, gen_iocp_purity.sh)
 *.bt
 __pycache__/
