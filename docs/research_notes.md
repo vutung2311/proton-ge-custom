@@ -3692,6 +3692,9 @@ default Proton; `tools/wwm/wwm_ab_run.sh` now refuses such runners.
 **Other results.**
 - *Rebase:* as of 2026-09-28 the branch sits on GE master `8473e3d2` and uses GE-Proton11-7, the
   newest release, as its template; a rebase would change nothing.
+  Update 2026-10-17: rebased onto GE master `01bfbf67` (GE-Proton11-9, Wine bleeding-edge
+  `981e2f0b`); the only conflict was the protonprep script, every patch still applies with no
+  rejects, the patched protocol stays 938, and the template moved to Lutris's stock GE-Proton11-9.
 - *`configure_wine_input.sh`* (local_diagnostic repository) now honours `--prefix`/`WINEPREFIX` and
   takes Wine from the prefix's `config_info`, instead of searching `PATH`.
 - *Harness clicks:* `wwm_screen.py locate` finds a button by its text (sparse OCR of the window,

@@ -12,7 +12,7 @@ each recommendation is in `docs/research_notes.md` (section numbers below).
 A clean build by default: it wipes `build/`, extracts every submodule at the commit this branch
 pins, applies `patches/` (Wine through `patches/protonprep-valve-staging.sh`, vkd3d-proton from
 `patches/vkd3d-proton`, the low-latency layer from `patches/vklayers`), compiles in the Steam Runtime
-container and overlays the result onto the stock GE-Proton11-7 template as
+container and overlays the result onto the stock GE-Proton11-9 template as
 `~/.local/share/lutris/runners/wine/GE-Proton11-custom`. It refuses to replace a runner that is in
 use, and checks wineserver protocol parity, the storage TRIM answer (§36) and that the low-latency
 layer's manifest points at the runner's own library (§39.2).

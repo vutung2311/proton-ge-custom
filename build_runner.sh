@@ -26,7 +26,7 @@ if [[ "${1:-}" =~ ^(-h|--help)$ ]]; then
     echo "  CLEAN_BUILD=1 (default)  Wipe ${0%/*}/build, re-extract and re-patch all sources, reconfigure and compile."
     echo "  CLEAN_BUILD=0            Reuse the existing patched shadow tree and compile incrementally. Refuses to"
     echo "                           run if any source commit or patch changed since that tree was prepared."
-    echo "  PREBUILT_BINARIES_SRC    Stock runner used as the template; must be the unmodified release this tree is (GE-Proton11-7)."
+    echo "  PREBUILT_BINARIES_SRC    Stock runner used as the template; must be the unmodified release this tree is (GE-Proton11-9)."
     echo "  RUNNER_DST               Target output path (default: ~/.local/share/lutris/runners/wine/GE-Proton11-custom)."
     exit 0
 fi
@@ -57,9 +57,8 @@ WINE_CONFIGURE_REVERT="e813ca5771658b00875924ab88d525322e50d39f"
 # protonprep steps that already fail on GE's own tree. GE's build does not stop on
 # patch failures, so a released GE-Proton can ship with such a step partially applied;
 # list exactly those (and their rejects) so the result matches GE. Anything else is fatal.
-# Empty on GE-Proton11-7 + master (74177a03): the earlier ws2_32 connect-address failure
-# applies cleanly there, and GE's 0062-winedmo-open-progressive-http-mp4-streams hunk,
-# whose context missed a blank line, is fixed in our copy of the patch instead.
+# Empty on GE-Proton11-9 + master (rebased 2026-10-17 onto upstream 01bfbf67, Wine
+# bleeding-edge 981e2f0b): every protonprep step applies cleanly, with no reject files.
 KNOWN_UPSTREAM_FAILED_STEPS=()
 KNOWN_UPSTREAM_REJECTS=()
 
@@ -67,20 +66,21 @@ KNOWN_UPSTREAM_REJECTS=()
 # is a patch file basename; apply_patch_dir skips it and says so.
 #   0010-lsteamclient-maintain-wayland-overlay-controller-focus.patch: GE commit 8c3c59f7
 #   (2026-09-20) adds `#include "steam_overlay_focus.h"` and `overlay_focus::sync()` to
-#   lsteamclient/unixlib.cpp but never committed that header, so lsteamclient fails to
-#   compile with it. Wayland-only overlay controller focus; not needed on X11.
+#   lsteamclient/unixlib.cpp; GE 87429b0f later made the patch generate that header itself,
+#   so it builds again, but it is still skipped: Wayland-only overlay controller focus,
+#   not needed on X11, and lsteamclient/unixlib.cpp at HEAD does not reference the header.
 SKIP_UPSTREAM_PATCHES=(
     "0010-lsteamclient-maintain-wayland-overlay-controller-focus.patch"
 )
 
-# The template must be the stock GE-Proton release this source tree is (GE-Proton11-7):
+# The template must be the stock GE-Proton release this source tree is (GE-Proton11-9):
 # it supplies everything not built here, notably the whole 32-bit Wine, whose wineserver
 # protocol must equal ours. A different release makes every 32-bit process fail with
-# "wine client error: version mismatch" (11-6 speaks protocol 935, 11-7 938).
-TEMPLATE_RELEASE="GE-Proton11-7"
+# "wine client error: version mismatch" (11-6 speaks protocol 935, 11-7 and 11-9 938).
+TEMPLATE_RELEASE="GE-Proton11-9"
 
-# Steam's copy first: the Lutris copy of GE-Proton11-7 on this machine was modified by hand
-# (a replaced ntdll.so, with the original kept as ntdll.so.orig).
+# Steam's copy first, then Lutris's; a hand-modified copy (e.g. a replaced ntdll.so with
+# the original kept as ntdll.so.orig) is rejected below.
 find_default_prebuilt_binaries_src() {
     local dir
     for dir in "$HOME/.local/share/Steam/compatibilitytools.d/${TEMPLATE_RELEASE}-x86_64" \
