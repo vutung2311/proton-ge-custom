@@ -42,6 +42,7 @@ SRC_FFMPEG="${BUILD_ROOT}/src-ffmpeg"
 SRC_VULKAN_HEADERS="${BUILD_ROOT}/src-Vulkan-Headers"
 SRC_VULKAN_UTILITY="${BUILD_ROOT}/src-Vulkan-Utility-Libraries"
 SRC_VOSK="${BUILD_ROOT}/src-vosk-api"
+XKBCOMMON_INCLUDE="${BUILD_ROOT}/xkbcommon-include"
 BUILD_VKD3D="${BUILD_ROOT}/obj-vkd3d-x86_64"
 STAGING_DIR="${BUILD_ROOT}/staging"
 BUILD_FFMPEG="${BUILD_ROOT}/obj-ffmpeg-x86_64"
@@ -207,7 +208,7 @@ inputs_fingerprint() {
 
 # Submodules the build reads; each is extracted at its pinned commit.
 PINNED_SOURCES=(wine wine-staging vkd3d-proton vklayers/low_latency_layer vklayers/Vulkan-Utility-Libraries
-                Vulkan-Headers protonfixes ffmpeg vosk-api)
+                Vulkan-Headers protonfixes ffmpeg vosk-api libxkbcommon)
 
 in_list() {
     local needle="$1"; shift
@@ -360,6 +361,18 @@ if [ "${NEED_PREP}" = "1" ]; then
     extract_pinned vklayers/Vulkan-Utility-Libraries "${SRC_VULKAN_UTILITY}"
     extract_pinned vosk-api "${SRC_VOSK}"
 
+    # Wine's Wayland driver needs xkbregistry, which the SteamRT SDK image does not provide,
+    # and xkbcommon newer than the image's 1.7 (XKB_VMOD_NAME_*); GE's Makefile builds both
+    # from the libxkbcommon submodule. The driver links against the libxkbcommon.so and
+    # libxkbregistry.so the template ships (that same submodule build), so only the headers
+    # are needed, at the commit this tree pins.
+    XKBCOMMON_SHA="$(pinned_commit libxkbcommon)"
+    ensure_commit "${PROTON_SRC}/libxkbcommon" "${XKBCOMMON_SHA}"
+    mkdir -p "${XKBCOMMON_INCLUDE}"
+    git -C "${PROTON_SRC}/libxkbcommon" archive "${XKBCOMMON_SHA}" include/xkbcommon \
+        | tar -x -C "${XKBCOMMON_INCLUDE}" --strip-components=1
+    ok "Extracted the xkbcommon headers from libxkbcommon ${XKBCOMMON_SHA:0:12}."
+
     # Pre-create all matching module directories in build tree
     (cd "${SRC_WINE}" && find dlls libs programs -type d | while read -r d; do
         mkdir -p "${BUILD_DIR}/${d}" "${BUILD_DIR}/${d}/x86_64-windows" "${BUILD_DIR}/${d}/x86_64-unix"
@@ -460,11 +473,17 @@ if [ ! -f "${BUILD_DIR}/Makefile" ]; then
         "${DOCKER_ENV[@]}" \
         -e PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig" \
         -u "$(id -u):$(id -g)" \
-        "${STEAMRT_IMAGE}" /bin/bash -c "${SRC_WINE}/configure --enable-win64 --disable-tests --prefix=/usr CFLAGS='-O2 -march=nocona -mtune=core-avx2 -fno-omit-frame-pointer -I${SRC_VOSK}/src' LDFLAGS='-L${PREBUILT_BINARIES_SRC}/files/lib/x86_64-linux-gnu -Wl,-rpath-link,${PREBUILT_BINARIES_SRC}/files/lib/x86_64-linux-gnu -Wl,-rpath-link,${FFMPEG_PREFIX}/lib'"
+        "${STEAMRT_IMAGE}" /bin/bash -c "${SRC_WINE}/configure --enable-win64 --disable-tests --prefix=/usr CFLAGS='-O2 -march=nocona -mtune=core-avx2 -fno-omit-frame-pointer -I${SRC_VOSK}/src' LDFLAGS='-L${PREBUILT_BINARIES_SRC}/files/lib/x86_64-linux-gnu -Wl,-rpath-link,${PREBUILT_BINARIES_SRC}/files/lib/x86_64-linux-gnu -Wl,-rpath-link,${FFMPEG_PREFIX}/lib' XKBCOMMON_CFLAGS='-I${XKBCOMMON_INCLUDE}' XKBCOMMON_LIBS='-lxkbcommon' XKBREGISTRY_CFLAGS='-I${XKBCOMMON_INCLUDE}' XKBREGISTRY_LIBS='-lxkbregistry'"
     ok "Configured Wine 64-bit."
 fi
 if ! grep -qE '^FFMPEG_LIBS *= *.*-lavformat' "${BUILD_DIR}/Makefile"; then
     err "Wine was configured without FFmpeg; winedmo would not be able to decode video."
+    exit 1
+fi
+# Without the Wayland driver the runner would silently keep the template's winewayland,
+# which carries none of this tree's Wayland patches.
+if grep -qE '^DISABLED_SUBDIRS *=.* dlls/winewayland\.drv( |$)' "${BUILD_DIR}/Makefile"; then
+    err "Wine was configured without the Wayland driver (see Wayland in ${BUILD_DIR}/config.log)."
     exit 1
 fi
 
@@ -661,6 +680,22 @@ while read -r lib; do
     fi
 done < <(readelf -d "${WINEDMO_SO}" | sed -n 's/.*Shared library: \[\(lib\(av\|sw\)[^]]*\)\].*/\1/p')
 ok "Runner ships the FFmpeg libraries winedmo.so needs."
+
+# The Wayland driver must be this build's, and must need no library the template's own
+# driver does not (those come from the runner or the Steam Runtime).
+BUILT_WAYLAND_SO="${RUNNER_DST}/files/lib/wine/x86_64-unix/winewayland.so"
+STOCK_WAYLAND_SO="${PREBUILT_BINARIES_SRC}/files/lib/wine/x86_64-unix/winewayland.so"
+if cmp -s "${BUILT_WAYLAND_SO}" "${STOCK_WAYLAND_SO}"; then
+    err "The runner's winewayland.so is the template's; this build's Wayland driver was not deployed."
+    exit 1
+fi
+needed_libs() { readelf -d "$1" | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p' | sort; }
+EXTRA_WAYLAND_LIBS="$(comm -23 <(needed_libs "${BUILT_WAYLAND_SO}") <(needed_libs "${STOCK_WAYLAND_SO}"))"
+if [ -n "${EXTRA_WAYLAND_LIBS}" ]; then
+    err "winewayland.so needs libraries the template's driver does not: ${EXTRA_WAYLAND_LIBS//$'\n'/ }"
+    exit 1
+fi
+ok "Runner ships this build's Wayland driver."
 
 # protonfixes: overlay the patched Python sources onto the template's installed
 # protonfixes. Only regular .py files: the source tree also carries repo files and

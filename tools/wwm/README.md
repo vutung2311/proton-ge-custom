@@ -18,6 +18,7 @@ read from the window's own contents (`wwm_grab.py`).
 | `wwm_gamelog_follow.py` | Follows the game log for the load-start marker. |
 | `gen_nt_census.sh`, `gen_iocp_purity.sh`, `iocp_purity_report.py` | bpftrace script generators for the profiler and the completion-port census. |
 | `wwm_click.c`, `wwm_windows.c` | In-Wine input and window listing; `wwm_ab_run.sh` builds the `.exe` files when needed. |
+| `wwm_wayland_lock_trace.py [pid]` | Who holds the Wayland driver's window data lock in a running or hung game, read from `/proc/<pid>/mem` without stopping it; lists the lock events since the outermost acquisition still in effect, with the calling functions. Needs Wine patch 0011. |
 
 Every run launches the game on Wine's Wayland driver, as it is played, whatever the Lutris entry
 says (restored on exit); `DISPLAY_DRIVER=x11` uses the X11 driver instead. The harness checks the

@@ -776,6 +776,12 @@ fi
     echo "WINE: -CUSTOM- win32u: find the present fence info before the host present"
     apply_patch "../patches/wine-hotfixes/pending/0008-win32u-find-present-fence-before-host-present.patch"
 
+    echo "WINE: -CUSTOM- winewayland: release only the locked window data in WindowPosChanged"
+    apply_patch "../patches/wine-hotfixes/pending/0010-winewayland-release-only-the-locked-window-data.patch"
+
+    echo "WINE: -CUSTOM- winewayland: trace the window data lock for hang diagnosis"
+    apply_patch "../patches/wine-hotfixes/pending/0011-winewayland-trace-the-window-data-lock.patch"
+
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"

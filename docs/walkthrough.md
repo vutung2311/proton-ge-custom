@@ -97,3 +97,4 @@ keeping it on (§39.2).
 | "Lutris started before GE-Proton11-custom existed" | Restart Lutris after rebuilding the runner. |
 | "LOW_LATENCY_LAYER=1 loaded ..., not the copy in ..." | Another manifest with the same layer name is installed on the host (§39.2). |
 | "screen checks on Wayland need the KWin capture helper" | Run `tools/wwm/setup_wayland_capture.sh`. |
+| Gray screen after a load, the game still running, GPU idle | A Wayland driver path kept its window data lock (seen 2026-10-21). Before closing the game, run `tools/wwm/wwm_wayland_lock_trace.py`: it names the code holding the lock. |

@@ -3854,3 +3854,46 @@ the pipeline cache (619 MB) and the moved host copies of the layer.
 `docs/walkthrough.md` is back, as a different document from the diary retired in §38: a short
 practical guide to building the runner, configuring the game and running the harness, pointing here
 for the evidence.
+
+## 40. Gray-Screen Hang: the Wayland Driver's Window Data Lock (2026-10-21)
+
+### 40.1 What the hung game showed
+
+The game stopped on a gray screen after a teleport into Space 501 and stayed there (40 minutes when
+inspected). It was examined without a debugger, from `/proc/<pid>/task/*/syscall`, `wchan` and
+`/proc/<pid>/mem`:
+
+- GPU at 5% and 40 W, no NVMe reads, wineserver idle; the server connection was alive and read.
+- `win_data_mutex` in `winewayland.so` (recursive) was held, count 1, by the main thread, which was
+  back in game code: in `NtRemoveIoCompletion` on its own in-process port, waking ~20 times a second.
+- The vkd3d-proton submit thread and Wine's Wayland event thread were blocked on that mutex; the
+  render thread waited without timeout on an event that only their work would set.
+- Ruled out: every in-process completion port (patch 0007) had an empty queue, posts equal to
+  dequeues and a waiter count matching the sleeping threads; the low-latency layer's signalling
+  thread had nothing pending and its other threads were in ordinary waits.
+
+So a Wayland driver path returned with the lock held. Which one could not be read from a stack
+scan: the lock is taken in ~40 functions across the wine-wayland and child-rendering series.
+
+### 40.2 The runner never built its own Wayland driver
+
+`build_runner.sh` configured Wine in the SteamRT SDK image, which has no xkbregistry; configure then
+disabled `dlls/winewayland.drv` and printed only a notice, and the runner kept the template's
+`winewayland.so` (byte-identical to stock GE-Proton11-9). GE's Makefile builds xkbcommon and
+xkbregistry from the `libxkbcommon` submodule; the driver also needs xkbcommon newer than the
+image's 1.7 (`XKB_VMOD_NAME_SCROLL`). The build now compiles against the pinned submodule's
+`include/xkbcommon` headers and links against the template's `libxkbcommon.so` and
+`libxkbregistry.so` (that same submodule build), fails if Wine is configured without the Wayland driver,
+and checks that the deployed driver is this build's and needs no library the stock driver does not.
+The hang above was therefore in GE's driver, built from the same Wayland patch series.
+
+### 40.3 Patches
+
+- **0010**: `WAYLAND_WindowPosChanged` looks the owner window up with
+  `wayland_win_data_get_nolock()` (child-rendering 0001 reverted wine-wayland 0022's locking lookup)
+  but still released it, unlocking the mutex once more than it locked it. The extra release is
+  removed. It drops a caller's outer hold early rather than leaking, so it does not explain the hang.
+- **0011**: a fixed record in `winewayland.so` (`wayland_win_data_lock_trace`) of the lock's owner,
+  depth, the caller of the outermost acquisition still in effect, the first 256 lock events since
+  then, and releases by threads that do not hold the lock. `tools/wwm/wwm_wayland_lock_trace.py`
+  reads it from the running game. At the next gray screen it names the path that kept the lock.

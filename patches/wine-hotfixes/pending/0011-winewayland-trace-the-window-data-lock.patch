@@ -1,0 +1,204 @@
+From: XProtocol Bot
+Subject: [PATCH] winewayland: Trace the window data lock for hang diagnosis.
+
+Where Winds Meet hung on a gray screen with win_data_mutex held by its main
+thread, which was back in game code: some path returned with the lock still
+held, and the vkd3d-proton submit thread and the Wayland event thread then
+blocked on it forever. Record, in a fixed structure in this module's memory
+(wayland_win_data_lock_trace), the thread holding the lock, its recursion
+depth, the caller of the outermost acquisition still in effect, the first 256
+lock and unlock events since then, and any release by a thread that does not
+hold the lock (also reported with ERR). Once a path keeps the lock it is never
+free again, so the recorded events start at the acquisition that leaked.
+tools/wwm/wwm_wayland_lock_trace.py reads it from a running (or hung) process
+through /proc/<pid>/mem, without stopping it. The lock functions are kept out of
+line so the recorded return addresses name their callers.
+---
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -25,8 +25,11 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
++#include <sys/syscall.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -53,6 +56,108 @@
+ 
+ static pthread_mutex_t win_data_mutex;
+ static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
++
++/* A record of who holds win_data_mutex, kept in this module's memory so that a hung process
++ * can be inspected without stopping it (tools/wwm/wwm_wayland_lock_trace.py reads it through
++ * /proc/<pid>/mem). It is only written by the thread that holds the lock, except the
++ * bad-release fields, which any thread may write. Once a code path returns with the lock
++ * still held, the lock never becomes free again, so the events recorded since the outermost
++ * acquisition start with the path that kept it. Layout is fixed: the reader decodes it. */
++#define WIN_DATA_TRACE_EVENTS 256
++
++enum win_data_trace_kind
++{
++    WIN_DATA_TRACE_GET = 1,      /* wayland_win_data_get() */
++    WIN_DATA_TRACE_CREATE = 2,   /* wayland_win_data_create(), returns locked */
++    WIN_DATA_TRACE_RELEASE = 3,  /* wayland_win_data_release() */
++    WIN_DATA_TRACE_DESTROY = 4,  /* wayland_win_data_destroy(), unlocks */
++};
++
++struct win_data_trace_event
++{
++    UINT64 caller;    /* return address into the caller of the lock function */
++    INT32  tid;       /* Unix thread id */
++    INT16  depth;     /* recursion depth after the event */
++    INT16  kind;      /* enum win_data_trace_kind */
++};
++
++struct win_data_lock_trace
++{
++    char   magic[16];               /* "WAYLAND_LOCK_TRC" */
++    INT32  owner_tid;               /* thread holding the lock, 0 when it is free */
++    INT32  depth;                   /* recursion depth of the owner */
++    UINT32 outer_count;             /* acquisitions that found the lock free */
++    UINT32 span_events;             /* events since then; the first WIN_DATA_TRACE_EVENTS are kept */
++    UINT64 outer_caller;            /* caller of the outermost acquisition still in effect */
++    UINT32 bad_releases;            /* releases by a thread that did not hold the lock */
++    INT32  bad_release_tid;         /* the last such release */
++    UINT64 bad_release_caller;
++    struct win_data_trace_event span[WIN_DATA_TRACE_EVENTS];
++};
++
++C_ASSERT(sizeof(struct win_data_trace_event) == 16);
++C_ASSERT(offsetof(struct win_data_lock_trace, span) == 56);
++
++__attribute__((used)) static struct win_data_lock_trace wayland_win_data_lock_trace =
++{
++    .magic = {'W','A','Y','L','A','N','D','_','L','O','C','K','_','T','R','C'},
++};
++
++/* No thread-local cache: TLS in this module would add a dependency on the dynamic loader. */
++static int win_data_trace_tid(void)
++{
++    return syscall(__NR_gettid);
++}
++
++static void win_data_trace_event(struct win_data_lock_trace *trace, void *caller, int tid,
++                                 enum win_data_trace_kind kind)
++{
++    UINT32 index = trace->span_events++;
++    struct win_data_trace_event *event;
++
++    if (index >= WIN_DATA_TRACE_EVENTS) return;
++    event = &trace->span[index];
++    event->caller = (UINT_PTR)caller;
++    event->tid = tid;
++    event->depth = trace->depth;
++    event->kind = kind;
++}
++
++/* Called right after win_data_mutex was locked. */
++static void win_data_trace_acquired(void *caller, enum win_data_trace_kind kind)
++{
++    struct win_data_lock_trace *trace = &wayland_win_data_lock_trace;
++    int tid = win_data_trace_tid();
++
++    if (!trace->depth++)
++    {
++        __atomic_store_n(&trace->owner_tid, tid, __ATOMIC_RELAXED);
++        trace->outer_count++;
++        trace->outer_caller = (UINT_PTR)caller;
++        trace->span_events = 0;
++    }
++    win_data_trace_event(trace, caller, tid, kind);
++}
++
++/* Called right before win_data_mutex is unlocked. */
++static void win_data_trace_releasing(void *caller, enum win_data_trace_kind kind)
++{
++    struct win_data_lock_trace *trace = &wayland_win_data_lock_trace;
++    int tid = win_data_trace_tid();
++
++    if (__atomic_load_n(&trace->owner_tid, __ATOMIC_RELAXED) != tid)
++    {
++        /* the unlock fails (recursive mutexes check the owner); remember who tried */
++        __atomic_add_fetch(&trace->bad_releases, 1, __ATOMIC_RELAXED);
++        __atomic_store_n(&trace->bad_release_tid, tid, __ATOMIC_RELAXED);
++        __atomic_store_n(&trace->bad_release_caller, (UINT_PTR)caller, __ATOMIC_RELAXED);
++        ERR("thread %04x released win_data_mutex without holding it (caller %p)\n", tid, caller);
++        return;
++    }
++    trace->depth--;
++    win_data_trace_event(trace, caller, tid, kind);
++    if (!trace->depth) __atomic_store_n(&trace->owner_tid, 0, __ATOMIC_RELAXED);
++}
+ static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd);
+ static BOOL window_surface_has_requested_configure(HWND hwnd);
+ static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd);
+@@ -69,7 +174,7 @@
+  *
+  * Create a data window structure for an existing window.
+  */
+-static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct window_rects *rects)
++static __attribute__((noinline)) struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct window_rects *rects)
+ {
+     struct wayland_win_data *data;
+     struct rb_entry *rb_entry;
+@@ -90,6 +195,7 @@
+     list_init(&data->client_surfaces);
+ 
+     pthread_mutex_lock(&win_data_mutex);
++    win_data_trace_acquired(__builtin_return_address(0), WIN_DATA_TRACE_CREATE);
+ 
+     /* Check that another thread hasn't already created the wayland_win_data. */
+     if ((rb_entry = rb_get(&win_data_rb, hwnd)))
+@@ -108,7 +214,7 @@
+ /***********************************************************************
+  *           wayland_win_data_destroy
+  */
+-static void wayland_win_data_destroy(struct wayland_win_data *data)
++static __attribute__((noinline)) void wayland_win_data_destroy(struct wayland_win_data *data)
+ {
+     struct wayland_client_surface *client, *next;
+ 
+@@ -125,6 +231,7 @@
+     data->client_surface = NULL;
+     rb_remove(&win_data_rb, &data->entry);
+ 
++    win_data_trace_releasing(__builtin_return_address(0), WIN_DATA_TRACE_DESTROY);
+     pthread_mutex_unlock(&win_data_mutex);
+ 
+     if (data->stashed_client) client_surface_release(&data->stashed_client->client);
+@@ -147,12 +254,16 @@
+     return NULL;
+ }
+ 
+-struct wayland_win_data *wayland_win_data_get(HWND hwnd)
++__attribute__((noinline)) struct wayland_win_data *wayland_win_data_get(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+ 
+     pthread_mutex_lock(&win_data_mutex);
+-    if ((data = wayland_win_data_get_nolock(hwnd))) return data;
++    if ((data = wayland_win_data_get_nolock(hwnd)))
++    {
++        win_data_trace_acquired(__builtin_return_address(0), WIN_DATA_TRACE_GET);
++        return data;
++    }
+     pthread_mutex_unlock(&win_data_mutex);
+     return NULL;
+ }
+@@ -162,9 +273,10 @@
+  *
+  * Release the data returned by wayland_win_data_get.
+  */
+-void wayland_win_data_release(struct wayland_win_data *data)
++__attribute__((noinline)) void wayland_win_data_release(struct wayland_win_data *data)
+ {
+     assert(data);
++    win_data_trace_releasing(__builtin_return_address(0), WIN_DATA_TRACE_RELEASE);
+     pthread_mutex_unlock(&win_data_mutex);
+ }
+ 
