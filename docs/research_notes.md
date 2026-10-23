@@ -3897,3 +3897,15 @@ The hang above was therefore in GE's driver, built from the same Wayland patch s
   depth, the caller of the outermost acquisition still in effect, the first 256 lock events since
   then, and releases by threads that do not hold the lock. `tools/wwm/wwm_wayland_lock_trace.py`
   reads it from the running game. At the next gray screen it names the path that kept the lock.
+
+### 40.4 The leak, caught (2026-10-23)
+
+The game froze again when a text input opened. `tools/wwm/wwm_wayland_lock_trace.py` on the live
+process: `win_data_mutex` held by the main thread, count 1, and since the outermost acquisition
+only three events, all from `WAYLAND_SetIMECompositionRect`: get, get, release. Child-rendering
+0001 made that function take the window data before `text_input->mutex` (the order
+`text_input_enter` uses) and release it at the end, but left the original
+`wayland_win_data_get()` after the focus check. With the recursive mutex the second get does not
+deadlock; it adds a hold that the success path never releases. The game sets the IME cursor
+rectangle when a text input opens and during loads, which fits both the input freeze and the gray
+screen after a teleport. **Patch 0012** drops the second get.
