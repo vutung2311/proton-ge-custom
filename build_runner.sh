@@ -70,8 +70,12 @@ KNOWN_UPSTREAM_REJECTS=()
 #   lsteamclient/unixlib.cpp; GE 87429b0f later made the patch generate that header itself,
 #   so it builds again, but it is still skipped: Wayland-only overlay controller focus,
 #   not needed on X11, and lsteamclient/unixlib.cpp at HEAD does not reference the header.
+#   0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch: upstream GE added
+#   this patch before bumping the protonfixes submodule (commit 58ce172b); the pinned
+#   submodule commit (28a02c25) already includes the fix files in-tree.
 SKIP_UPSTREAM_PATCHES=(
     "0010-lsteamclient-maintain-wayland-overlay-controller-focus.patch"
+    "0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch"
 )
 
 # The template must be the stock GE-Proton release this source tree is (GE-Proton11-11):

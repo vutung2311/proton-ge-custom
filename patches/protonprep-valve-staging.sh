@@ -782,9 +782,6 @@ fi
     echo "WINE: -CUSTOM- winewayland: trace the window data lock for hang diagnosis"
     apply_patch "../patches/wine-hotfixes/pending/0011-winewayland-trace-the-window-data-lock.patch"
 
-    echo "WINE: -CUSTOM- winewayland: take the window data lock once in SetIMECompositionRect"
-    apply_patch "../patches/wine-hotfixes/pending/0012-winewayland-take-the-window-data-lock-once-in-SetIMECompositionRect.patch"
-
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
