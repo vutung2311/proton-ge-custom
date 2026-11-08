@@ -763,6 +763,20 @@ if [ "${parity_rc}" != "0" ]; then
 fi
 ok "All Wine clients speak the wineserver protocol of this build."
 
+# Verify device manager, kernel drivers, and network subsystem (catches internal Wine IPC opcode drift)
+info "Checking device manager, kernel drivers, and network subsystem..."
+NET_LOG="${BUILD_ROOT}/parity_net.log"
+net_rc=0
+WINEPREFIX="${PARITY_PFX}" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" \
+    timeout 60 "${WINELOADER_BIN}" ping -n 1 127.0.0.1 > "${NET_LOG}" 2>&1 || net_rc=$?
+WINEPREFIX="${PARITY_PFX}" "${WINESERVER_BIN}" -w
+if [ "${net_rc}" != "0" ] || ! grep -q "Reply from 127.0.0.1" "${NET_LOG}"; then
+    cat "${NET_LOG}" >&2
+    err "Network and device manager verification failed in ${RUNNER_DST} (exit ${net_rc}); see ${NET_LOG}"
+    exit 1
+fi
+ok "Device manager and network subsystem verified successfully."
+
 # Regression check: the storage answers Where Winds Meet's streaming depends on
 # (docs/research_notes.md §36). Without StorageDeviceTrimProperty its teleport load
 # takes ~47 s instead of ~12 s.
