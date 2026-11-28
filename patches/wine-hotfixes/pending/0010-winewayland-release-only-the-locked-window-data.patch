@@ -1,0 +1,25 @@
+From: XProtocol Bot
+Subject: [PATCH] winewayland: Release only the locked window data in WindowPosChanged.
+
+wine-wayland's "Make window lock mutex recursive" took the owner's data with
+wayland_win_data_get() and released it at the end of WAYLAND_WindowPosChanged.
+The wineland child-rendering series then looks the owner up with
+wayland_win_data_get_nolock() again, but the release stayed: every call with an
+owner unlocked win_data_mutex once more than it locked it. On a recursive mutex
+that drops a caller's outer hold early (another thread can take the lock while
+the caller still uses window data), and the caller's own release later fails.
+owner_data and toplevel_data are looked up under the lock taken for data; only
+that one is released.
+---
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1053,7 +1053,8 @@
+         wayland_win_data_update_wayland_state(data);
+     }
+ 
+-    if (owner_data) wayland_win_data_release(owner_data);
++    /* owner_data and toplevel_data come from wayland_win_data_get_nolock(), under the
++     * lock taken for data: only that one is released. */
+     wayland_win_data_release(data);
+ }
+ 
