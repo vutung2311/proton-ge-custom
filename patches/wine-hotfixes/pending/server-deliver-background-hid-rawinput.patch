@@ -1,0 +1,55 @@
+From: XProtocol Bot
+Subject: server: Deliver HID raw input to background sinks when nothing is foreground.
+
+queue_custom_hardware_message() dropped HID WM_INPUT and WM_INPUT_DEVICE_CHANGE
+whenever the desktop had no foreground thread, before queue_rawinput_message()
+could check RIDEV_INPUTSINK / RIDEV_DEVNOTIFY.  After the host focus moves to a
+non-Wine window, Wine sets the desktop window foreground or deactivates the
+window, and GetForegroundWindow() returns NULL; a game whose SDL2 registered
+its pad with RIDEV_INPUTSINK then received nothing (20/20 taps before focus
+loss, 0/20 after), and a pad plugged in meanwhile was never announced.
+Windows keeps delivering to sink registrations in that state.
+
+With no foreground thread, treat every registration as a background one: only
+RIDEV_INPUTSINK registrations get WM_INPUT (with RIM_INPUTSINK), DEVNOTIFY
+registrations get device changes.  INPUTSINK already requires a target window
+(RegisterRawInputDevices), and a message without a target and without a focus
+window is still dropped by queue_hardware_message().  Mouse and keyboard raw
+input are unchanged.
+
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -2209,7 +2209,8 @@
+     if (!device) return;
+ 
+     if (raw_msg->message == WM_INPUT_DEVICE_CHANGE && !(device->flags & RIDEV_DEVNOTIFY)) return;
+-    if (process != raw_msg->foreground->process)
++    /* without a foreground thread, every registration is a background one */
++    if (!raw_msg->foreground || process != raw_msg->foreground->process)
+     {
+         if (raw_msg->message == WM_INPUT && !(device->flags & RIDEV_INPUTSINK)) return;
+         wparam = RIM_INPUTSINK;
+@@ -2750,9 +2751,13 @@
+     case WM_INPUT_DEVICE_CHANGE:
+         if (input->hw.hid.length * input->hw.hid.count != get_req_data_size())
+             set_error( STATUS_INVALID_PARAMETER );
+-        else if ((foreground = get_foreground_thread( desktop, win )))
++        else
+         {
+             struct rawinput_message raw_msg = {0};
++            /* Windows still delivers HID input to RIDEV_INPUTSINK and device changes
++             * to RIDEV_DEVNOTIFY registrations when no window is in the foreground,
++             * e.g. after the user switched to a non-Wine window. */
++            foreground = get_foreground_thread( desktop, win );
+             raw_msg.foreground = foreground;
+             raw_msg.source     = source;
+             raw_msg.time       = get_tick_count();
+@@ -2761,7 +2766,7 @@
+             rawhid_init( &raw_msg.rawinput, &raw_msg.data.hid, input );
+ 
+             dispatch_rawinput_message( desktop, &raw_msg );
+-            release_object( foreground );
++            if (foreground) release_object( foreground );
+         }
+         return;
+     }
