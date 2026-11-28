@@ -1,0 +1,30 @@
+From: Open-Wine-Components <fixes@proton-ge-custom>
+Date: Sun, 8 Nov 2026 23:05:00 +0700
+Subject: [PATCH] utilities: Skip extra mount drives for Where Winds Meet or when DISABLE_EXTRA_DRIVES=1
+
+Proton's default behavior mounts /media, /run/media, /mnt, and ~ as extra DOS
+drives (u:, v:, w:, x:). When running Where Winds Meet, detect.dll scans all
+mounted drives and traverses Steam compatdata symlinks recursively, causing an
+infinite directory traversal loop and 100% CPU lockup at 'Dump Inited'.
+
+Skip setting up extra mount drives when DISABLE_EXTRA_DRIVES=1 or when the
+game ID indicates Where Winds Meet.
+---
+--- a/utilities.py
++++ b/utilities.py
+@@ -53,6 +53,15 @@
+ 
+ def setup_mount_drives(func: Callable[[str, str, str], None]) -> None:
+     """Set up mount point drives for proton."""
++    if os.environ.get('DISABLE_EXTRA_DRIVES', '0') == '1':
++        return
++    game_id = (
++        os.environ.get('UMU_ID', '')
++        or os.environ.get('GAMEID', '')
++        or os.environ.get('SteamGameId', '')
++    )
++    if 'where-winds-meet' in game_id or 'wwm' in game_id:
++        return
+     if os.environ.get('UMU_ID', ''):
+         drive_map = {
+             '/media': 'u:',
