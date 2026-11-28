@@ -1,0 +1,35 @@
+proton: set WINE_MIDI_SOUNDFONT for the built-in winemidisynth
+
+Upstream GE commits 3e0b0f60/a9e7ea27 (refs #949) add a software MIDI synth to
+Wine and install soundfonts/GeneralUser-GS.sf2 into files/share/soundfonts/,
+with the proton script pointing winemidisynth at it through WINE_MIDI_SOUNDFONT.
+build_runner.sh overlays this build onto a stock GE-Proton11-11 template whose
+proton script predates that change, so these are the two upstream hunks, applied
+to the template's proton at packaging time (patches/template-runner/ is not read by
+protonprep; the repository's own proton already carries them).
+
+diff --git a/proton b/proton
+index c0dd5786..347f2960 100755
+--- a/proton
++++ b/proton
+@@ -749,6 +749,7 @@ class Proton:
+         self.lib_dir = self.path("files/lib/")
+         self.fonts_dir = self.path("files/share/fonts/")
+         self.media_dir = self.path("files/share/media/")
++        self.default_soundfont = self.path("files/share/soundfonts/GeneralUser-GS.sf2")
+         self.wine_fonts_dir = self.path("files/share/wine/fonts/")
+         self.wine_inf = self.path("files/share/wine/wine.inf")
+         self.version_file = self.path("version")
+@@ -2086,6 +2087,12 @@ class Session:
+                 self.env["WINE_CPU_TOPOLOGY"] = topo_str
+ 
+ 
++        # Software MIDI synth, used only if the host has no MIDI device of its own
++        if not nonzero(self.env.get("PROTON_NO_MIDI_SYNTH", "0")):
++            soundfont = self.env.get("PROTON_MIDI_SOUNDFONT") or g_proton.default_soundfont
++            if file_exists(soundfont, follow_symlinks=True):
++                self.env["WINE_MIDI_SOUNDFONT"] = soundfont
++
+         if "WINE_HIDE_AMD_GPU" not in self.env and appid in [
+                     "1282690",
+                 ]:
