@@ -824,6 +824,9 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- wineboot: env gates for SystemBiosDate and CentralProcessor FeatureSet"
     apply_patch "../patches/wine-hotfixes/pending/0005-wineboot-env-gates-bios-date-featureset.patch"
 
+    echo "WINE: -CUSTOM- mountmgr.sys: report StorageDeviceTrimProperty (TrimEnabled) as GE-Proton10 did"
+    apply_patch "../patches/wine-hotfixes/pending/0006-mountmgr-report-storage-trim-property.patch"
+
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
