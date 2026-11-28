@@ -1,0 +1,197 @@
+From: XProtocol Bot <96406390+xprotocol-bot@users.noreply.github.com>
+Subject: [PATCH] winebus: send one SDL input report per device update.
+
+The SDL backend queued an HID input report for every SDL button and axis
+event, so one device update that changes several controls reached Windows as
+several reports, each with a state the device never had: an update with LB
+and RB pressed together became "LB" then "LB+RB", a diagonal stick move became
+"X moved" then "X and Y moved", A with the right trigger became "A", "A",
+"A+RT". Games reading the HID report stream (SDL's RawInput and HIDAPI
+drivers, Windows.Gaming.Input, buffered DirectInput) see each of them as a
+separate frame, and XInput can return one of the partial states. On Windows,
+and with this module's evdev backend (one report per SYN_REPORT), one device
+update is one report.
+
+SDL reads each device update in one pump and queues one event per changed
+control. Handle the events already queued by that pump without pumping
+again, mark the devices they change, and queue one report per changed device
+afterwards. Reports are flushed before device arrival and removal events so
+they keep their order. Nothing is delayed: the reports go out as soon as the
+pump's events are handled. Updates that arrive within the same SDL poll
+(1 ms) are merged, as XInput polling on Windows would merge them.
+---
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -116,6 +116,7 @@
+ MAKE_FUNCPTR(SDL_GameControllerAddMapping);
+ MAKE_FUNCPTR(SDL_RegisterEvents);
+ MAKE_FUNCPTR(SDL_PushEvent);
++MAKE_FUNCPTR(SDL_PeepEvents);
+ MAKE_FUNCPTR(SDL_GetTicks);
+ MAKE_FUNCPTR(SDL_LogSetPriority);
+ MAKE_FUNCPTR(SDL_SetHintWithPriority);
+@@ -153,6 +154,7 @@
+     LONG effect_flags;
+     int axis_offset;
+     int sony_button_count; /* non-zero for the native Sony layout */
++    BOOL report_dirty; /* input state changed since the last queued report */
+ };
+ 
+ static inline struct sdl_device *impl_from_unix_device(struct unix_device *iface)
+@@ -890,10 +892,32 @@
+     pthread_mutex_unlock(&sdl_cs);
+ }
+ 
++/* Queue one input report for each device whose state changed. */
++static void queue_dirty_reports(void)
++{
++    struct sdl_device *impl;
++
++    pthread_mutex_lock(&sdl_cs);
++    LIST_FOR_EACH_ENTRY(impl, &device_list, struct sdl_device, unix_device.entry)
++    {
++        struct hid_device_state *state = &impl->unix_device.hid_device_state;
++
++        if (!impl->report_dirty) continue;
++        impl->report_dirty = FALSE;
++        bus_event_queue_input_report(&event_queue, &impl->unix_device, state->report_buf, state->report_len);
++    }
++    pthread_mutex_unlock(&sdl_cs);
++}
++
++static BOOL is_input_event(UINT type)
++{
++    return (type >= SDL_JOYAXISMOTION && type <= SDL_JOYBUTTONUP) ||
++           (type >= SDL_CONTROLLERAXISMOTION && type <= SDL_CONTROLLERBUTTONUP);
++}
++
+ static BOOL set_report_from_joystick_event(struct sdl_device *impl, SDL_Event *event)
+ {
+     struct unix_device *iface = &impl->unix_device;
+-    struct hid_device_state *state = &iface->hid_device_state;
+ 
+     if (impl->sdl_controller) return TRUE; /* use controller events instead */
+ 
+@@ -905,7 +929,7 @@
+             SDL_JoyButtonEvent *ie = &event->jbutton;
+ 
+             hid_device_set_button(iface, ie->button, ie->state);
+-            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++            impl->report_dirty = TRUE;
+             break;
+         }
+         case SDL_JOYAXISMOTION:
+@@ -913,7 +937,7 @@
+             SDL_JoyAxisEvent *ie = &event->jaxis;
+ 
+             if (!hid_device_set_abs_axis(iface, ie->axis, ie->value)) break;
+-            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++            impl->report_dirty = TRUE;
+             break;
+         }
+         case SDL_JOYBALLMOTION:
+@@ -922,7 +946,7 @@
+ 
+             if (!hid_device_set_rel_axis(iface, 2 * ie->ball, ie->xrel)) break;
+             hid_device_set_rel_axis(iface, 2 * ie->ball + 1, ie->yrel);
+-            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++            impl->report_dirty = TRUE;
+             break;
+         }
+         case SDL_JOYHATMOTION:
+@@ -930,7 +954,7 @@
+             SDL_JoyHatEvent *ie = &event->jhat;
+ 
+             set_hat_value(iface, ie->hat, ie->value);
+-            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++            impl->report_dirty = TRUE;
+             break;
+         }
+         default:
+@@ -944,7 +968,6 @@
+ static BOOL set_report_from_controller_event(struct sdl_device *impl, SDL_Event *event)
+ {
+     struct unix_device *iface = &impl->unix_device;
+-    struct hid_device_state *state = &iface->hid_device_state;
+ 
+     switch (event->type)
+     {
+@@ -966,7 +989,7 @@
+                     if ((button = sony_button_index(ie->button)) != -1) hid_device_set_button(iface, button, ie->state);
+                     break;
+                 }
+-                bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++                impl->report_dirty = TRUE;
+                 break;
+             }
+ 
+@@ -996,7 +1019,7 @@
+             if (button == 13) hid_device_move_hatswitch(iface, 0, ie->state ? -1 : +1, 0);
+             if (button == 11) hid_device_move_hatswitch(iface, 0, ie->state ? +1 : -1, 0);
+             hid_device_set_button(iface, button, ie->state);
+-            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++            impl->report_dirty = TRUE;
+             break;
+         }
+         case SDL_CONTROLLERAXISMOTION:
+@@ -1006,7 +1029,7 @@
+             if (impl->sony_button_count)
+             {
+                 sony_set_axis(iface, ie->axis, ie->value);
+-                bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++                impl->report_dirty = TRUE;
+                 break;
+             }
+ 
+@@ -1014,7 +1037,7 @@
+                 ie->value = -ie->value - 1; /* match XUSB / GIP protocol */
+ 
+             hid_device_set_abs_axis(iface, ie->axis, ie->value);
+-            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
++            impl->report_dirty = TRUE;
+             break;
+         }
+         default:
+@@ -1346,6 +1369,7 @@
+     LOAD_FUNCPTR(SDL_GameControllerAddMapping);
+     LOAD_FUNCPTR(SDL_RegisterEvents);
+     LOAD_FUNCPTR(SDL_PushEvent);
++    LOAD_FUNCPTR(SDL_PeepEvents);
+     LOAD_FUNCPTR(SDL_GetTicks);
+     LOAD_FUNCPTR(SDL_LogSetPriority);
+     LOAD_FUNCPTR(SDL_SetHintWithPriority);
+@@ -1417,12 +1441,30 @@
+     /* cleanup previously returned event */
+     bus_event_cleanup(result);
+ 
+-    do
++    for (;;)
+     {
+         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
+-        if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
+-        else check_all_devices_effects_state();
+-    } while (event.type != quit_event);
++        if (!pSDL_WaitEventTimeout(&event, 10))
++        {
++            check_all_devices_effects_state();
++            continue;
++        }
++
++        /* SDL reads each device update (an evdev SYN_REPORT, a HID report) in
++         * one pump and queues one event per changed control. Handle the events
++         * that pump queued without pumping again, then send one HID report per
++         * changed device, so that a single update with several controls is not
++         * split into reports with states the device never had. */
++        do
++        {
++            if (event.type == quit_event) break;
++            if (!is_input_event(event.type)) queue_dirty_reports();
++            process_device_event(&event);
++        } while (pSDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT) > 0);
++        queue_dirty_reports();
++
++        if (event.type == quit_event) break;
++    }
+ 
+     TRACE("SDL main loop exiting\n");
+     bus_event_queue_destroy(&event_queue);

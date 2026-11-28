@@ -716,6 +716,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winebus-sdl-keep-sony-pads-when-hidraw-is-disabled.patch"
     # Bluetooth DualShock 4 presented as a wired one, like the DualSense
     apply_patch "../patches/wine-hotfixes/pending/winebus-expose-bluetooth-dualshock4-as-usb.patch"
+    # SDL pads: one HID report per device update, not one per changed control
+    apply_patch "../patches/wine-hotfixes/pending/winebus-sdl-one-report-per-device-update.patch"
     apply_patch "../patches/wine-hotfixes/pending/winepulse-bluetooth-dualshock4-audio.patch"
     apply_patch "../patches/wine-hotfixes/pending/winedmo-disable-d3d11-aware-for-phantom-blade-zero.patch"
     # FlatOut 2 (#939): XInput deadlocked when first called with the loader lock held
