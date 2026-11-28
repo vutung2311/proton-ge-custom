@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XProtocol Bot <dmitriy@xprotocol.org>
+Date: Tue, 29 Sep 2026 20:01:13 +0700
+Subject: [PATCH] vkd3d: drive VK_NV_low_latency2 from Present (VKD3D_FORCE_LOW_LATENCY)
+
+Games that ship only a vendor low-latency integration (for example NVIDIA
+Reflex through Streamline) never call ID3DLowLatencyDevice on other GPUs, so a
+VK_NV_low_latency2 implementation such as the low-latency layer stays idle.
+
+With VKD3D_FORCE_LOW_LATENCY=1, and only when the device exposes
+VK_NV_low_latency2, Present makes the calls such an integration would make,
+through the same ID3DLowLatencyDevice entry points: low-latency mode on,
+PRESENT_START/PRESENT_END around each Present with the present count as the
+frame ID, then LatencySleep and SIMULATION_START for the next frame. The next
+frame's submissions are tagged with that ID, and the present now carries the
+same ID as a present ID also on non-FIFO modes, where vkd3d does not pace on
+present waits; nothing waits on it there, so present_id_valid stays unset.
+
+VKD3D_FORCE_LOW_LATENCY_FPS=<n> optionally passes a frame cap as the sleep
+mode's minimum interval, so it is applied before a frame starts. With VRR,
+keep it a few FPS below the display's maximum refresh rate.
+---
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -179,6 +179,10 @@
+ 
+     bool debug_latency;
+     bool swapchain_maintenance1;
++    /* VKD3D_FORCE_LOW_LATENCY=1: drive VK_NV_low_latency2 from Present (app thread only). */
++    bool force_low_latency;
++    bool force_low_latency_mode_set;
++    uint32_t force_low_latency_interval_us;
+ 
+     struct
+     {
+@@ -1120,6 +1124,34 @@
+     }
+ }
+ 
++/* VKD3D_FORCE_LOW_LATENCY: for applications that do not use the low-latency API themselves, make
++ * the calls a Reflex integration would make, through the same entry points: sleep mode on,
++ * PRESENT_START/END around each Present with the present count as frame ID, then sleep before
++ * the next frame and mark its simulation start. The next frame's submissions are then tagged with
++ * frame ID + 1 (d3d12_command_queue_latency_frame_id), and the present carries the same ID
++ * (dxgi_vk_swap_chain_present_iteration), which is how a VK_NV_low_latency2 implementation such
++ * as the low-latency layer pairs a frame's GPU work with its present. */
++static void dxgi_vk_swap_chain_forced_low_latency_begin(struct dxgi_vk_swap_chain *chain, uint64_t frame_id)
++{
++    d3d_low_latency_device_iface *ll = &chain->queue->device->ID3DLowLatencyDevice_iface;
++
++    if (!chain->force_low_latency_mode_set)
++    {
++        ll->lpVtbl->SetLatencySleepMode(ll, TRUE, FALSE, chain->force_low_latency_interval_us);
++        chain->force_low_latency_mode_set = true;
++    }
++    ll->lpVtbl->SetLatencyMarker(ll, frame_id, VK_LATENCY_MARKER_PRESENT_START_NV);
++}
++
++static void dxgi_vk_swap_chain_forced_low_latency_end(struct dxgi_vk_swap_chain *chain, uint64_t frame_id)
++{
++    d3d_low_latency_device_iface *ll = &chain->queue->device->ID3DLowLatencyDevice_iface;
++
++    ll->lpVtbl->SetLatencyMarker(ll, frame_id, VK_LATENCY_MARKER_PRESENT_END_NV);
++    ll->lpVtbl->LatencySleep(ll);
++    ll->lpVtbl->SetLatencyMarker(ll, frame_id + 1, VK_LATENCY_MARKER_SIMULATION_START_NV);
++}
++
+ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *iface, UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+@@ -1138,6 +1170,9 @@
+ 
+     assert(chain->user.index < chain->desc.BufferCount);
+ 
++    if (chain->force_low_latency)
++        dxgi_vk_swap_chain_forced_low_latency_begin(chain, chain->user.present_count + 1);
++
+     /* The present iteration on present thread has a similar counter and it will pick up the request from the ring. */
+     chain->user.present_count += 1;
+     request = &chain->request_ring[chain->user.present_count % ARRAY_SIZE(chain->request_ring)];
+@@ -1239,6 +1274,9 @@
+     vkd3d_queue_timeline_trace_complete_present_block(
+             &chain->queue->device->queue_timeline_trace, cookie);
+ 
++    if (chain->force_low_latency)
++        dxgi_vk_swap_chain_forced_low_latency_end(chain, chain->user.present_count);
++
+     return S_OK;
+ }
+ 
+@@ -3080,8 +3118,35 @@
+         use_present_id = true;
+     }
+     else
++    {
+         use_present_id = false;
+ 
++        if (chain->force_low_latency && chain->request.low_latency_frame_id)
++        {
++            /* Carry the frame ID even when vkd3d does not pace on present waits here, so the
++             * VK_NV_low_latency2 implementation can pair this present with the frame's
++             * submissions. Nothing waits on this ID (use_present_id stays false). IDs stay
++             * strictly increasing per swapchain, shared with the pacing path above. */
++            chain->present.present_id = max(chain->present.present_id + 1, chain->request.low_latency_frame_id);
++            if (chain->present.wait2)
++            {
++                present_id2.sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR;
++                present_id2.pNext = NULL;
++                present_id2.swapchainCount = 1;
++                present_id2.pPresentIds = &chain->present.present_id;
++                vk_prepend_struct(&present_info, &present_id2);
++            }
++            else if (chain->queue->device->device_info.present_id_features.presentId)
++            {
++                present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
++                present_id.pNext = NULL;
++                present_id.swapchainCount = 1;
++                present_id.pPresentIds = &chain->present.present_id;
++                vk_prepend_struct(&present_info, &present_id);
++            }
++        }
++    }
++
+     if (chain->queue->device->vk_info.NV_low_latency2 && chain->request.low_latency_frame_id)
+     {
+         dxgi_vk_swap_chain_set_latency_marker(chain, chain->request.low_latency_frame_id,
+@@ -3751,6 +3816,28 @@
+     if (vkd3d_get_env_var("VKD3D_SWAPCHAIN_DEBUG_LATENCY", env, sizeof(env)) && strcmp(env, "1") == 0)
+         chain->debug_latency = true;
+ 
++    if (chain->queue->device->vk_info.NV_low_latency2 &&
++            vkd3d_get_env_var("VKD3D_FORCE_LOW_LATENCY", env, sizeof(env)) && strcmp(env, "1") == 0)
++    {
++        INFO("Driving VK_NV_low_latency2 from Present (VKD3D_FORCE_LOW_LATENCY=1).\n");
++        chain->force_low_latency = true;
++
++        /* Optional cap, applied by the low-latency sleep before the frame starts rather than
++         * after it is rendered. With VRR, keep it a few FPS below the maximum refresh rate. */
++        if (vkd3d_get_env_var("VKD3D_FORCE_LOW_LATENCY_FPS", env, sizeof(env)))
++        {
++            double fps = strtod(env, NULL);
++
++            if (fps >= 1.0 && fps <= 1000.0)
++            {
++                chain->force_low_latency_interval_us = (uint32_t)(1.0e6 / fps);
++                INFO("Low-latency frame cap %.1lf FPS (%u us).\n", fps, chain->force_low_latency_interval_us);
++            }
++            else
++                WARN("Ignoring VKD3D_FORCE_LOW_LATENCY_FPS=%s, expected 1 to 1000.\n", env);
++        }
++    }
++
+     return S_OK;
+ }
+ 
