@@ -810,6 +810,13 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- winewayland: start toplevels at the scale of their output (borderless window clipped at fractional scaling)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-start-toplevels-at-the-output-scale.patch"
 
+### (2-8) CUSTOM RUNNER PATCHES ###
+
+    echo "WINE: -CUSTOM- server: runtime gates for thread priority->nice mapping and main-thread boost"
+    apply_patch "../patches/wine-hotfixes/pending/0002-server-gate-thread-priority-nice-and-boost.patch"
+
+### END CUSTOM RUNNER PATCHES ###
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
