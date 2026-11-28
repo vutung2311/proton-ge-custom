@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: proton-ge-custom <noreply@localhost>
+Date: Mon, 28 Sep 2026 04:10:00 +0700
+Subject: [PATCH] ntdll: add WINE_HIDE_CPU_FEATURES to hide processor features from IsProcessorFeaturePresent
+
+Wine 11 reports PF_AVX512F, PF_ERMS, PF_BMI2, PF_RDPID, PF_MOVDIR64B and
+PF_RDWRFSGSBASE that Wine 10 did not. Where Winds Meet selects its asset
+streaming code path from IsProcessorFeaturePresent() and takes a ~4x slower
+path when these are reported. Diagnostic gate: a comma-separated list of
+feature names to report as absent, default off.
+---
+ dlls/ntdll/unix/system.c | 49 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -446,6 +446,52 @@
+     return features;
+ }
+ 
++/* WINE_HIDE_CPU_FEATURES: comma-separated list of processor features to report as absent
++ * (e.g. "avx512f,erms"). Games select code paths from IsProcessorFeaturePresent(); Wine 11
++ * started reporting several features that Wine 10 did not, and Where Winds Meet takes a
++ * much slower asset-streaming path when it sees them. Diagnostic gate, default off. */
++static void hide_cpu_features( BOOLEAN *features )
++{
++    static const struct { const char *name; unsigned int pf; } table[] =
++    {
++        { "avx",       PF_AVX_INSTRUCTIONS_AVAILABLE },
++        { "avx2",      PF_AVX2_INSTRUCTIONS_AVAILABLE },
++        { "avx512f",   PF_AVX512F_INSTRUCTIONS_AVAILABLE },
++        { "erms",      PF_ERMS_AVAILABLE },
++        { "bmi2",      PF_BMI2_INSTRUCTIONS_AVAILABLE },
++        { "rdpid",     PF_RDPID_INSTRUCTION_AVAILABLE },
++        { "movdir64b", PF_MOVDIR64B_INSTRUCTION_AVAILABLE },
++        { "fsgsbase",  PF_RDWRFSGSBASE_AVAILABLE },
++        { "rdtscp",    PF_RDTSCP_INSTRUCTION_AVAILABLE },
++        { "monitorx",  PF_MONITORX_INSTRUCTION_AVAILABLE },
++        { "cx128",     PF_COMPARE_EXCHANGE128 },
++        { "sse42",     PF_SSE4_2_INSTRUCTIONS_AVAILABLE },
++    };
++    const char *env = getenv( "WINE_HIDE_CPU_FEATURES" );
++    const char *p;
++    unsigned int i;
++
++    if (!env || !*env) return;
++    for (p = env; *p; )
++    {
++        const char *end = strchr( p, ',' );
++        size_t len = end ? (size_t)(end - p) : strlen( p );
++
++        for (i = 0; i < ARRAY_SIZE(table); i++)
++        {
++            if (strlen( table[i].name ) == len && !strncasecmp( p, table[i].name, len ))
++            {
++                TRACE( "hiding processor feature %s (PF %u)\n", table[i].name, table[i].pf );
++                features[table[i].pf] = FALSE;
++                break;
++            }
++        }
++        if (i == ARRAY_SIZE(table))
++            WARN( "unknown feature %s in WINE_HIDE_CPU_FEATURES\n", debugstr_an( p, len ) );
++        p = end ? end + 1 : p + len;
++    }
++}
++
+ static void init_xstate_features( XSTATE_CONFIGURATION *xstate )
+ {
+     static const ULONG64 supported_features = (1 << XSTATE_AVX) | (1 << XSTATE_MPX_BNDREGS) |
+@@ -548,6 +594,8 @@
+         features[PF_3DNOW_INSTRUCTIONS_AVAILABLE]   = !!(regs[3] & (1u << 31));
+     }
+ 
++    hide_cpu_features( features );
++
+     if (features[PF_XSAVE_ENABLED])
+         init_xstate_features( &data->XState );
+ }
+-- 
+2.43.0

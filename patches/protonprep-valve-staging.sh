@@ -818,6 +818,9 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- winepulse: retry a failed stream connect with default attributes"
     apply_patch "../patches/wine-hotfixes/pending/0003-winepulse-fallback-connect.patch"
 
+    echo "WINE: -CUSTOM- ntdll: WINE_HIDE_CPU_FEATURES env gate for IsProcessorFeaturePresent"
+    apply_patch "../patches/wine-hotfixes/pending/0004-ntdll-hide-cpu-features-env.patch"
+
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
