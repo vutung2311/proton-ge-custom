@@ -1,0 +1,860 @@
+From: XProtocol Bot
+Subject: [PATCH] ntdll: Serve same-process completion-port traffic in-process.
+
+Job systems post and dequeue completion packets on ports only their own threads use; every
+NtSetIoCompletion and NtRemoveIoCompletion is a wineserver round trip (~3 us, ~90% of it kernel
+time). Where Winds Meet does ~12.9 million of them per session on such ports. Keep the queue of
+an unnamed, non-inheritable port in the process until it is used in a way only the server can
+serve (file/socket bind, job association, duplication out of this process, handle-flag change,
+NtSetIoCompletionEx, alertable dequeue, direct wait); then hand its packets to the server object
+in order and let the server serve it from then on. WINE_INPROC_IOCP=0 disables it; +iocp traces
+every port taken in-process and every demotion with its reason.
+---
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -50,6 +50,7 @@
+ 	unix/debug.c \
+ 	unix/env.c \
+ 	unix/file.c \
++	unix/iocp.c \
+ 	unix/fsync.c \
+ 	unix/loader.c \
+ 	unix/loadorder.c \
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5559,6 +5559,7 @@
+         {
+             FILE_COMPLETION_INFORMATION *info = ptr;
+ 
++            inproc_iocp_demote( info->CompletionPort, "file or socket bound" );
+             SERVER_START_REQ( set_completion_info )
+             {
+                 req->handle   = wine_server_obj_handle( handle );
+@@ -8409,6 +8410,7 @@
+ 
+         if (len < sizeof(*p)) return STATUS_INVALID_BUFFER_SIZE;
+ 
++        inproc_iocp_demote( handle, "handle flags changed" );
+         SERVER_START_REQ( set_handle_info )
+         {
+             req->handle = wine_server_obj_handle( handle );
+--- a/dlls/ntdll/unix/iocp.c
++++ b/dlls/ntdll/unix/iocp.c
+@@ -0,0 +1,639 @@
++/*
++ * In-process I/O completion ports for same-process traffic
++ *
++ * Copyright 2026 XProtocol Bot
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Job systems post and dequeue tens of thousands of completion packets per second on ports
++ * that nothing but their own threads ever touch; each post and each dequeue is a wineserver
++ * round trip. For such ports the queue is kept in the process instead: a port qualifies when
++ * it is created unnamed, not inheritable and with query and modify access, and while it only
++ * sees NtSetIoCompletion, non-alertable NtRemoveIoCompletion[Ex], NtQueryIoCompletion and
++ * NtClose from this process.
++ *
++ * The server object always exists. The first time a port is used in a way only the server can
++ * serve (a file or socket bound to it, a job object associated, its handle duplicated out of
++ * this process or its handle flags changed, NtSetIoCompletionEx, an alertable dequeue, a direct
++ * wait on the handle), its queued packets are handed to the server in order and the port is
++ * served by the server from then on ("demotion"; it is never undone). Duplications that only
++ * name the port's handle value in another process do not demote.
++ *
++ * Not covered: another process duplicating this process's port handle on its own initiative
++ * and posting to it; those packets go to the server object, which in-process waiters do not
++ * see. Waiters sleep on a futex with signals unblocked, so suspension and system APCs reach
++ * them as they reach any other thread outside a server wait. A thread terminated while waiting
++ * keeps the port's waiter count raised, so that port's small bookkeeping structure is not
++ * freed when the port is closed.
++ *
++ * Handles are compared with their two low bits cleared, as the server does.
++ *
++ * Locking: port_table_lock (read for lookups, write for registration, demotion and close),
++ * then a port's mutex; both are only held with signals blocked (server_block_set), so a
++ * suspended or terminated thread never holds them. User memory is only written after they are
++ * released. WINE_INPROC_IOCP=0 disables the whole
++ * mechanism; WINEDEBUG=+iocp logs every port taken in-process and every demotion with its
++ * reason and the traffic served in-process until then.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <errno.h>
++#include <limits.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#ifdef __linux__
++# include <linux/futex.h>
++# include <sys/syscall.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "wine/server.h"
++#include "wine/list.h"
++#include "wine/debug.h"
++#include "unix_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(iocp);
++
++#ifdef __linux__
++
++struct iocp_packet
++{
++    struct list entry;
++    ULONG_PTR   key;
++    ULONG_PTR   value;
++    NTSTATUS    status;
++    ULONG_PTR   information;
++};
++
++struct inproc_port
++{
++    HANDLE          handle;
++    pthread_mutex_t mutex;
++    struct list     queue;    /* struct iocp_packet, FIFO */
++    ULONG           depth;
++    LONG            seq;      /* futex word, bumped on every post that finds waiters, close and demotion */
++    unsigned int    waiters;  /* threads registered for a futex wait on seq */
++    BOOL            gone;     /* removed from the table: closed or demoted */
++    BOOL            closed;   /* its handle was closed; waiters return STATUS_ABANDONED_WAIT_0 */
++    ULONGLONG       posts;    /* traffic served in-process, for the +iocp trace */
++    ULONGLONG       removes;
++};
++
++#define MAX_INPROC_PORTS 64
++#define MAX_DRAIN        64   /* packets copied out per NtRemoveIoCompletionEx call */
++
++static pthread_rwlock_t port_table_lock;         /* initialized by the first registration */
++static pthread_once_t port_table_once = PTHREAD_ONCE_INIT;
++/* Entries never move while registered, so an unlocked scan of port_keys cannot miss a live
++ * port; it can only see a stale key, which the locked lookup then rejects. */
++static struct inproc_port *port_table[MAX_INPROC_PORTS];
++static ULONG_PTR port_keys[MAX_INPROC_PORTS];   /* port_key() of each used slot, 0 when free */
++static unsigned int nb_slots;                   /* highest used slot + 1; written under the write lock */
++static unsigned int nb_ports;                   /* live ports; written under the write lock */
++
++static inline ULONG_PTR port_key( HANDLE handle )
++{
++    return (ULONG_PTR)handle & ~(ULONG_PTR)3;
++}
++
++static int is_enabled(void)
++{
++    static int enabled = -1;
++    int value = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
++
++    if (value == -1)
++    {
++        const char *env = getenv( "WINE_INPROC_IOCP" );
++        value = !(env && env[0] == '0');
++        if (!value) TRACE( "disabled by WINE_INPROC_IOCP=0\n" );
++        __atomic_store_n( &enabled, value, __ATOMIC_RELAXED );
++    }
++    return value;
++}
++
++static void init_port_table(void)
++{
++    pthread_rwlockattr_t attr;
++
++    pthread_rwlockattr_init( &attr );
++#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
++    /* lookups never starve registration, demotion and close */
++    pthread_rwlockattr_setkind_np( &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP );
++#endif
++    pthread_rwlock_init( &port_table_lock, &attr );
++    pthread_rwlockattr_destroy( &attr );
++}
++
++/* Readers only get here once a port was registered, so the lock is initialized. */
++static void table_lock( BOOL write, sigset_t *sigset )
++{
++    pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
++    if (write) pthread_rwlock_wrlock( &port_table_lock );
++    else pthread_rwlock_rdlock( &port_table_lock );
++}
++
++static void table_unlock( sigset_t *sigset )
++{
++    pthread_rwlock_unlock( &port_table_lock );
++    pthread_sigmask( SIG_SETMASK, sigset, NULL );
++}
++
++static int futex_wait( LONG *addr, LONG val, const struct timespec *timeout )
++{
++    return syscall( __NR_futex, addr, FUTEX_WAIT_PRIVATE, val, timeout, NULL, 0 );
++}
++
++static void futex_wake( LONG *addr, int count )
++{
++    syscall( __NR_futex, addr, FUTEX_WAKE_PRIVATE, count, NULL, NULL, 0 );
++}
++
++static LONGLONG monotonic_ns(void)
++{
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++/* The monotonic deadline in ns for a non-zero NT timeout, or -1 for none (infinite). */
++static LONGLONG deadline_from_timeout( const LARGE_INTEGER *timeout )
++{
++    LONGLONG rel, now_ns;
++
++    if (!timeout) return -1;
++    if (timeout->QuadPart < 0) rel = timeout->QuadPart == LLONG_MIN ? LLONG_MAX : -timeout->QuadPart;
++    else
++    {
++        LARGE_INTEGER now;
++        NtQuerySystemTime( &now );
++        rel = timeout->QuadPart > now.QuadPart ? timeout->QuadPart - now.QuadPart : 0;
++    }
++    now_ns = monotonic_ns();
++    if (rel > (LLONG_MAX - now_ns) / 100) return -1;  /* too far away to matter: wait forever */
++    return now_ns + rel * 100;
++}
++
++/* Called with port_table_lock held. */
++static int table_index( HANDLE handle )
++{
++    ULONG_PTR key = port_key( handle );
++    unsigned int i;
++
++    for (i = 0; i < nb_slots; i++) if (port_table[i] && port_keys[i] == key) return i;
++    return -1;
++}
++
++/* Called with port_table_lock held for writing and the port's mutex held. */
++static void table_remove( int index )
++{
++    unsigned int n = nb_slots;
++
++    port_table[index]->gone = TRUE;
++    port_table[index] = NULL;
++    __atomic_store_n( &port_keys[index], 0, __ATOMIC_RELAXED );
++    while (n && !port_table[n - 1]) n--;
++    __atomic_store_n( &nb_slots, n, __ATOMIC_RELEASE );
++    __atomic_store_n( &nb_ports, nb_ports - 1, __ATOMIC_RELEASE );
++}
++
++static void free_port( struct inproc_port *port )
++{
++    struct iocp_packet *pkt, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( pkt, next, &port->queue, struct iocp_packet, entry ) free( pkt );
++    pthread_mutex_destroy( &port->mutex );
++    free( port );
++}
++
++/* Wake every waiter of a port that left the table. Called with the port's mutex held. */
++static void wake_all_locked( struct inproc_port *port )
++{
++    __atomic_add_fetch( &port->seq, 1, __ATOMIC_RELEASE );
++    if (port->waiters) futex_wake( &port->seq, INT_MAX );
++}
++
++static BOOL is_registered( HANDLE handle )
++{
++    ULONG_PTR key = port_key( handle );
++    unsigned int i, n;
++
++    if (!__atomic_load_n( &nb_ports, __ATOMIC_ACQUIRE )) return FALSE;
++    n = __atomic_load_n( &nb_slots, __ATOMIC_ACQUIRE );
++    for (i = 0; i < n && i < MAX_INPROC_PORTS; i++)
++        if (__atomic_load_n( &port_keys[i], __ATOMIC_RELAXED ) == key) return TRUE;
++    return FALSE;
++}
++
++/* Lock the port registered for handle; signals stay blocked until unlock_port().
++ * Returns NULL (signals unchanged) when the handle is not an in-process port. */
++static struct inproc_port *lock_port( HANDLE handle, sigset_t *sigset )
++{
++    struct inproc_port *port = NULL;
++    int index;
++
++    if (!is_registered( handle )) return NULL;
++    table_lock( FALSE, sigset );
++    if ((index = table_index( handle )) >= 0)
++    {
++        port = port_table[index];
++        pthread_mutex_lock( &port->mutex );
++    }
++    pthread_rwlock_unlock( &port_table_lock );
++    if (!port) pthread_sigmask( SIG_SETMASK, sigset, NULL );
++    return port;
++}
++
++/* Unlock a port; frees it when it has left the table and nobody waits on it any more. */
++static void unlock_port( struct inproc_port *port, sigset_t *sigset )
++{
++    BOOL release = port->gone && !port->waiters;
++
++    pthread_mutex_unlock( &port->mutex );
++    if (release) free_port( port );
++    pthread_sigmask( SIG_SETMASK, sigset, NULL );
++}
++
++/* Hand the port's packets to the server object in order, take the port out of the table and
++ * wake its waiters (they retry through the server). Called with port_table_lock held for
++ * writing and the port locked; keeping the table locked holds off new posts and dequeues until
++ * the server has the packets. */
++static void demote_locked( struct inproc_port *port, int index, const char *reason )
++{
++    struct iocp_packet *pkt, *next;
++
++    TRACE( "port %p demoted (%s) after %s posts and %s dequeues in-process; %u queued packets handed to the server\n",
++           port->handle, reason, wine_dbgstr_longlong( port->posts ), wine_dbgstr_longlong( port->removes ), port->depth );
++    LIST_FOR_EACH_ENTRY_SAFE( pkt, next, &port->queue, struct iocp_packet, entry )
++    {
++        unsigned int ret;
++
++        SERVER_START_REQ( add_completion )
++        {
++            req->handle      = wine_server_obj_handle( port->handle );
++            req->ckey        = pkt->key;
++            req->cvalue      = pkt->value;
++            req->status      = pkt->status;
++            req->information = pkt->information;
++            ret = wine_server_call( req );
++        }
++        SERVER_END_REQ;
++        if (ret) ERR( "port %p: packet lost while handing over to the server: %#x\n", port->handle, ret );
++        list_remove( &pkt->entry );
++        free( pkt );
++    }
++    port->depth = 0;
++    table_remove( index );
++    wake_all_locked( port );
++}
++
++/***********************************************************************
++ *           inproc_iocp_register
++ *
++ * Called after a completion port was created by the server.
++ */
++void inproc_iocp_register( HANDLE handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
++{
++    const ACCESS_MASK needed = IO_COMPLETION_QUERY_STATE | IO_COMPLETION_MODIFY_STATE;
++    struct inproc_port *port;
++    sigset_t sigset;
++    int index;
++
++    if (!is_enabled()) return;
++    if (attr && ((attr->ObjectName && attr->ObjectName->Length) || (attr->Attributes & OBJ_INHERIT))) return;
++    /* the server checks access on every request; only take ports that pass all of them */
++    if (!(access & (GENERIC_ALL | MAXIMUM_ALLOWED)) && (access & needed) != needed) return;
++    if (!(port = calloc( 1, sizeof(*port) ))) return;
++    port->handle = handle;
++    {
++        pthread_mutexattr_t attr;
++
++        pthread_mutexattr_init( &attr );
++#ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
++        /* the critical sections are a few list operations: spin briefly before sleeping */
++        pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_ADAPTIVE_NP );
++#endif
++        pthread_mutex_init( &port->mutex, &attr );
++        pthread_mutexattr_destroy( &attr );
++    }
++    list_init( &port->queue );
++
++    pthread_once( &port_table_once, init_port_table );
++    table_lock( TRUE, &sigset );
++    if ((index = table_index( handle )) >= 0)
++    {
++        /* a stale entry for a recycled handle value: its handle is gone, treat it as closed */
++        struct inproc_port *old = port_table[index];
++        BOOL release;
++
++        pthread_mutex_lock( &old->mutex );
++        old->closed = TRUE;
++        table_remove( index );
++        wake_all_locked( old );
++        release = !old->waiters;
++        pthread_mutex_unlock( &old->mutex );
++        if (release) free_port( old );
++    }
++    for (index = 0; index < MAX_INPROC_PORTS; index++) if (!port_table[index]) break;
++    if (index < MAX_INPROC_PORTS)
++    {
++        TRACE( "port %p served in-process\n", handle );
++        port_table[index] = port;
++        __atomic_store_n( &port_keys[index], port_key( handle ), __ATOMIC_RELAXED );
++        if (index >= nb_slots) __atomic_store_n( &nb_slots, index + 1, __ATOMIC_RELEASE );
++        __atomic_store_n( &nb_ports, nb_ports + 1, __ATOMIC_RELEASE );
++        port = NULL;
++    }
++    table_unlock( &sigset );
++    if (port) free_port( port );  /* table full: the port stays with the server */
++}
++
++/***********************************************************************
++ *           inproc_iocp_demote
++ *
++ * The port is about to be used in a way only the server supports.
++ */
++void inproc_iocp_demote( HANDLE handle, const char *reason )
++{
++    sigset_t sigset;
++    int index;
++
++    if (!__atomic_load_n( &nb_ports, __ATOMIC_ACQUIRE )) return;
++    table_lock( TRUE, &sigset );
++    if ((index = table_index( handle )) >= 0)
++    {
++        struct inproc_port *port = port_table[index];
++        BOOL release;
++
++        pthread_mutex_lock( &port->mutex );
++        demote_locked( port, index, reason );
++        release = !port->waiters;
++        pthread_mutex_unlock( &port->mutex );
++        if (release) free_port( port );
++    }
++    table_unlock( &sigset );
++}
++
++/***********************************************************************
++ *           inproc_iocp_demote_waited
++ *
++ * Direct waits on a port handle need the server object's signaled state. The unlocked scan
++ * cannot miss a port this thread could know the handle of: registration completes before
++ * NtCreateIoCompletion returns it.
++ */
++void inproc_iocp_demote_waited( const HANDLE *handles, DWORD count )
++{
++    DWORD i;
++
++    if (!__atomic_load_n( &nb_ports, __ATOMIC_ACQUIRE )) return;
++    for (i = 0; i < count; i++)
++        if (is_registered( handles[i] )) inproc_iocp_demote( handles[i], "direct wait on the port handle" );
++}
++
++/***********************************************************************
++ *           inproc_iocp_duplicate
++ *
++ * Called before NtDuplicateObject. Only a duplication of this process's own port handle
++ * matters; the same handle value in another process is a different object.
++ */
++void inproc_iocp_duplicate( HANDLE source_process, HANDLE source )
++{
++    if (!is_registered( source )) return;
++    if (source_process != NtCurrentProcess())
++    {
++        PROCESS_BASIC_INFORMATION pbi;
++
++        if (!NtQueryInformationProcess( source_process, ProcessBasicInformation, &pbi, sizeof(pbi), NULL ) &&
++            pbi.UniqueProcessId != (ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess)
++            return;
++    }
++    inproc_iocp_demote( source, "handle duplicated" );
++}
++
++/***********************************************************************
++ *           inproc_iocp_close
++ *
++ * Called from NtClose before the server closes the handle. An in-process port has exactly one
++ * handle (duplication demotes it), so this closes the port: queued packets are discarded and
++ * waiters return STATUS_ABANDONED_WAIT_0, as the server does.
++ */
++void inproc_iocp_close( HANDLE handle )
++{
++    sigset_t sigset;
++    int index;
++
++    if (!__atomic_load_n( &nb_ports, __ATOMIC_ACQUIRE )) return;
++    table_lock( TRUE, &sigset );
++    if ((index = table_index( handle )) >= 0)
++    {
++        struct inproc_port *port = port_table[index];
++        struct iocp_packet *pkt, *next;
++        BOOL release;
++
++        pthread_mutex_lock( &port->mutex );
++        TRACE( "port %p closed after %s posts and %s dequeues in-process\n", port->handle,
++               wine_dbgstr_longlong( port->posts ), wine_dbgstr_longlong( port->removes ) );
++        port->closed = TRUE;
++        table_remove( index );
++        LIST_FOR_EACH_ENTRY_SAFE( pkt, next, &port->queue, struct iocp_packet, entry )
++        {
++            list_remove( &pkt->entry );
++            free( pkt );
++        }
++        port->depth = 0;
++        wake_all_locked( port );
++        release = !port->waiters;
++        pthread_mutex_unlock( &port->mutex );
++        if (release) free_port( port );
++    }
++    table_unlock( &sigset );
++}
++
++/***********************************************************************
++ *           inproc_iocp_post
++ *
++ * Returns FALSE when the handle is not an in-process port (the caller asks the server).
++ */
++BOOL inproc_iocp_post( HANDLE handle, ULONG_PTR key, ULONG_PTR value, NTSTATUS status,
++                       ULONG_PTR information, NTSTATUS *ret )
++{
++    struct inproc_port *port;
++    struct iocp_packet *pkt;
++    sigset_t sigset;
++
++    if (!is_registered( handle )) return FALSE;
++    if (!(pkt = malloc( sizeof(*pkt) )))
++    {
++        *ret = STATUS_NO_MEMORY;
++        return TRUE;
++    }
++    if (!(port = lock_port( handle, &sigset )))
++    {
++        free( pkt );
++        return FALSE;
++    }
++    pkt->key         = key;
++    pkt->value       = value;
++    pkt->status      = status;
++    pkt->information = information;
++    list_add_tail( &port->queue, &pkt->entry );
++    port->depth++;
++    port->posts++;
++    if (port->waiters)
++    {
++        __atomic_add_fetch( &port->seq, 1, __ATOMIC_RELEASE );
++        futex_wake( &port->seq, 1 );
++    }
++    unlock_port( port, &sigset );
++    *ret = STATUS_SUCCESS;
++    return TRUE;
++}
++
++/***********************************************************************
++ *           inproc_iocp_remove
++ *
++ * Dequeue up to count packets (at most MAX_DRAIN) from an in-process port. Returns FALSE when
++ * the caller must ask the server instead: the handle is not an in-process port, the wait is
++ * alertable (the port is demoted first), or the port was demoted while this thread waited; in
++ * the last case a relative or absolute *timeout is replaced by the relative time left.
++ */
++BOOL inproc_iocp_remove( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
++                         ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable, NTSTATUS *ret )
++{
++    FILE_IO_COMPLETION_INFORMATION entries[MAX_DRAIN];
++    struct inproc_port *port;
++    struct timespec ts;
++    LONGLONG deadline, left;
++    NTSTATUS status = STATUS_SUCCESS;
++    sigset_t sigset;
++    ULONG i, n = 0;
++    BOOL demoted = FALSE;
++
++    if (!(port = lock_port( handle, &sigset ))) return FALSE;
++    if (alertable)
++    {
++        /* user APC delivery needs the server wait */
++        unlock_port( port, &sigset );
++        inproc_iocp_demote( handle, "alertable dequeue" );
++        return FALSE;
++    }
++
++    deadline = (timeout && timeout->QuadPart) ? deadline_from_timeout( timeout ) : -1;
++    if (count > MAX_DRAIN) count = MAX_DRAIN;
++    for (;;)
++    {
++        if (port->closed) { status = STATUS_ABANDONED_WAIT_0; break; }
++        if (port->gone) { demoted = TRUE; break; }
++        if (!list_empty( &port->queue ))
++        {
++            while (n < count && !list_empty( &port->queue ))
++            {
++                struct iocp_packet *pkt = LIST_ENTRY( list_head( &port->queue ), struct iocp_packet, entry );
++
++                entries[n].CompletionKey             = pkt->key;
++                entries[n].CompletionValue           = pkt->value;
++                entries[n].IoStatusBlock.Status      = pkt->status;
++                entries[n].IoStatusBlock.Information = pkt->information;
++                n++;
++                list_remove( &pkt->entry );
++                free( pkt );
++                port->depth--;
++            }
++            port->removes += n;
++            status = STATUS_SUCCESS;
++            break;
++        }
++        if (timeout && !timeout->QuadPart) { status = STATUS_TIMEOUT; break; }
++        if (deadline >= 0)
++        {
++            if ((left = deadline - monotonic_ns()) <= 0) { status = STATUS_TIMEOUT; break; }
++            ts.tv_sec  = left / 1000000000;
++            ts.tv_nsec = left % 1000000000;
++        }
++
++        {
++            LONG seq = __atomic_load_n( &port->seq, __ATOMIC_ACQUIRE );
++
++            port->waiters++;
++            pthread_mutex_unlock( &port->mutex );
++            pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++            /* woken, EAGAIN (seq moved), EINTR or ETIMEDOUT: all recheck the state above */
++            futex_wait( &port->seq, seq, deadline >= 0 ? &ts : NULL );
++            pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
++            pthread_mutex_lock( &port->mutex );
++            port->waiters--;
++        }
++    }
++    unlock_port( port, &sigset );
++
++    if (demoted)
++    {
++        if (deadline >= 0)
++        {
++            left = deadline - monotonic_ns();
++            timeout->QuadPart = left > 0 ? -(left / 100) : 0;
++        }
++        return FALSE;
++    }
++    for (i = 0; i < n; i++) info[i] = entries[i];
++    *written = n ? n : 1;  /* as the server path reports it */
++    *ret = status;
++    return TRUE;
++}
++
++/***********************************************************************
++ *           inproc_iocp_query
++ */
++BOOL inproc_iocp_query( HANDLE handle, ULONG *depth )
++{
++    struct inproc_port *port;
++    sigset_t sigset;
++    ULONG value;
++
++    if (!(port = lock_port( handle, &sigset ))) return FALSE;
++    value = port->depth;
++    unlock_port( port, &sigset );
++    *depth = value;
++    return TRUE;
++}
++
++#else  /* __linux__ */
++
++void inproc_iocp_register( HANDLE handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr ) {}
++void inproc_iocp_demote( HANDLE handle, const char *reason ) {}
++void inproc_iocp_demote_waited( const HANDLE *handles, DWORD count ) {}
++void inproc_iocp_duplicate( HANDLE source_process, HANDLE source ) {}
++void inproc_iocp_close( HANDLE handle ) {}
++BOOL inproc_iocp_post( HANDLE handle, ULONG_PTR key, ULONG_PTR value, NTSTATUS status,
++                       ULONG_PTR information, NTSTATUS *ret ) { return FALSE; }
++BOOL inproc_iocp_remove( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
++                         ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable,
++                         NTSTATUS *ret ) { return FALSE; }
++BOOL inproc_iocp_query( HANDLE handle, ULONG *depth ) { return FALSE; }
++
++#endif  /* __linux__ */
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1939,6 +1939,8 @@
+ 
+     if (dest) *dest = 0;
+ 
++    inproc_iocp_duplicate( source_process, source );
++
+     if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())
+     {
+         union apc_call call;
+@@ -2036,6 +2038,8 @@
+     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
+         return STATUS_SUCCESS;
+ 
++    inproc_iocp_close( handle );
++
+     /* hold fd_cache_mutex to prevent the fd from being added again between the
+      * call to remove_fd_from_cache and close_handle */
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1630,6 +1630,7 @@
+         break;
+     case JobObjectAssociateCompletionPortInformation:
+         if (len != sizeof(JOBOBJECT_ASSOCIATE_COMPLETION_PORT)) return STATUS_INVALID_PARAMETER;
++        inproc_iocp_demote( ((JOBOBJECT_ASSOCIATE_COMPLETION_PORT *)info)->CompletionPort, "job object associated" );
+         SERVER_START_REQ( set_job_completion_port )
+         {
+             JOBOBJECT_ASSOCIATE_COMPLETION_PORT *port_info = info;
+@@ -2355,6 +2356,8 @@
+         if (is_pseudo_handle( handles[i] )) return STATUS_INVALID_HANDLE;
+     }
+ 
++    inproc_iocp_demote_waited( handles, count );
++
+     if ((ret = inproc_wait( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
+@@ -2381,6 +2384,7 @@
+ 
+     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+ 
++    inproc_iocp_demote_waited( &handle, 1 );
+     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
+@@ -2410,6 +2414,7 @@
+ 
+     if (!signal) return STATUS_INVALID_HANDLE;
+ 
++    inproc_iocp_demote_waited( &wait, 1 );
+     if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+         return ret;
+ 
+@@ -2777,6 +2782,7 @@
+     SERVER_END_REQ;
+ 
+     free( objattr );
++    if (!status) inproc_iocp_register( *handle, access, attr );
+     return status;
+ }
+ 
+@@ -2816,6 +2822,11 @@
+ 
+     TRACE( "(%p, %lx, %lx, %x, %lx)\n", handle, key, value, status, count );
+ 
++    {
++        NTSTATUS inproc_ret;
++        if (inproc_iocp_post( handle, key, value, status, count, &inproc_ret )) return inproc_ret;
++    }
++
+     SERVER_START_REQ( add_completion )
+     {
+         req->handle      = wine_server_obj_handle( handle );
+@@ -2844,6 +2855,7 @@
+            key, value, status, count );
+ 
+     if (!completion_reserve_handle) return STATUS_INVALID_HANDLE;
++    inproc_iocp_demote( completion_handle, "NtSetIoCompletionEx" );
+ 
+     SERVER_START_REQ( add_completion )
+     {
+@@ -2865,11 +2877,33 @@
+ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *value,
+                                       IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout )
+ {
++    FILE_IO_COMPLETION_INFORMATION entry;
+     HANDLE wait_handle = NULL;
++    LARGE_INTEGER left;
++    NTSTATUS inproc_status;
+     unsigned int status;
++    ULONG written;
+ 
+     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+ 
++    if (timeout)
++    {
++        left = *timeout;
++        timeout = &left;
++    }
++    if (inproc_iocp_remove( handle, &entry, 1, &written, timeout, FALSE, &inproc_status ))
++    {
++        status = inproc_status;
++        if (!status)
++        {
++            *key            = entry.CompletionKey;
++            *value          = entry.CompletionValue;
++            io->Information = entry.IoStatusBlock.Information;
++            io->Status      = entry.IoStatusBlock.Status;
++        }
++        return status;
++    }
++
+     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
+     {
+         status = NtWaitForSingleObject( handle, FALSE, timeout );
+@@ -2918,6 +2952,7 @@
+                                         ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable )
+ {
+     HANDLE wait_handle = NULL;
++    LARGE_INTEGER left;
+     unsigned int status;
+     ULONG i = 0;
+ 
+@@ -2925,6 +2960,17 @@
+ 
+     if (!count) return STATUS_INVALID_PARAMETER;
+ 
++    if (timeout)
++    {
++        left = *timeout;
++        timeout = &left;
++    }
++    {
++        NTSTATUS inproc_status;
++        if (inproc_iocp_remove( handle, info, count, written, timeout, alertable, &inproc_status ))
++            return inproc_status;
++    }
++
+     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
+     {
+         status = NtWaitForSingleObject( handle, alertable, timeout );
+@@ -3004,6 +3050,14 @@
+         if (ret_len) *ret_len = sizeof(*info);
+         if (len == sizeof(*info))
+         {
++            ULONG depth;
++
++            if (inproc_iocp_query( handle, &depth ))
++            {
++                *info = depth;
++                status = STATUS_SUCCESS;
++                break;
++            }
+             SERVER_START_REQ( query_completion )
+             {
+                 req->handle = wine_server_obj_handle( handle );
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -421,6 +421,17 @@
+ 
+ extern void close_inproc_sync( HANDLE handle );
+ 
++extern void inproc_iocp_register( HANDLE handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr );
++extern void inproc_iocp_demote( HANDLE handle, const char *reason );
++extern void inproc_iocp_demote_waited( const HANDLE *handles, DWORD count );
++extern void inproc_iocp_duplicate( HANDLE source_process, HANDLE source );
++extern void inproc_iocp_close( HANDLE handle );
++extern BOOL inproc_iocp_post( HANDLE handle, ULONG_PTR key, ULONG_PTR value, NTSTATUS status,
++                              ULONG_PTR information, NTSTATUS *ret );
++extern BOOL inproc_iocp_remove( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
++                                ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable, NTSTATUS *ret );
++extern BOOL inproc_iocp_query( HANDLE handle, ULONG *depth );
++
+ extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
+                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
+ extern NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context );

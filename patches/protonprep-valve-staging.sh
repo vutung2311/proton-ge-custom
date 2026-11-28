@@ -830,6 +830,9 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- ntdll: LTO build"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-lto-build.patch"
 
+    echo "WINE: -CUSTOM- ntdll: serve same-process completion-port traffic in-process"
+    apply_patch "../patches/wine-hotfixes/pending/0007-ntdll-in-process-completion-ports.patch"
+
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
