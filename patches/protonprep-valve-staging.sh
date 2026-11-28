@@ -13,6 +13,14 @@ apply_all_in_dir() {
     done
 }
 
+# PROTONPREP_WINE_ONLY=1: only patch the wine tree at ./wine, which the caller has
+# already extracted and to which it has already applied the e813ca57 revert. The
+# in-place submodule prep and every git reset/clean/checkout/revert are skipped, so
+# this mode is safe on a disposable shadow tree (see build_runner.sh).
+WINE_ONLY="${PROTONPREP_WINE_ONLY:-0}"
+
+if [ "$WINE_ONLY" != "1" ]; then
+
 ### (1) PREP SECTION ###
 
     # Wine-Mono is reset from its pinned release archive rather than a Git submodule.
@@ -119,10 +127,13 @@ apply_all_in_dir() {
 
     echo "VRCLIENT: apply build fixes"
     apply_all_in_dir "patches/vrclient"
+fi
 
 ### (2) WINE PATCHING ###
 
     pushd wine
+
+if [ "$WINE_ONLY" != "1" ]; then
     git reset --hard HEAD
     git clean -xdf
 
@@ -134,6 +145,7 @@ apply_all_in_dir() {
     git revert --no-commit e813ca5771658b00875924ab88d525322e50d39f
 
 ### END PROBLEMATIC COMMIT REVERT SECTION ###
+fi
 
 ### (2-2) EM-11/WINE-WAYLAND PATCH SECTION ###
 
