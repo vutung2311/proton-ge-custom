@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XProtocol Bot <dmitriy@xprotocol.org>
+Date: Tue, 29 Sep 2026 20:01:13 +0700
+Subject: [PATCH] low_latency_layer: read the present ID before calling down, accept VkPresentId2KHR
+
+notify_present walked the present's pNext chain after the driver's
+vkQueuePresentKHR returned. A driver has been seen leaving a link into its own,
+by then dead, stack frame in that chain (RADV with a present ID; the same
+defect crashed Wine's post-present walk), so take the present ID before the
+call and hand the strategy a copy with no chain.
+
+Accept VkPresentId2KHR as well as VkPresentIdKHR: vkd3d-proton uses the
+former on swapchains with VK_KHR_present_wait2, and without it the layer never
+pairs those presents with the frame's submissions. Both have the same layout;
+the sType is given by value because the layer builds against headers that
+predate it.
+---
+--- a/src/layer.cc
++++ b/src/layer.cc
+@@ -549,12 +549,35 @@
+     const auto context = layer_context.get_context(queue);
+     const auto& vtable = context->device.vtable;
+ 
++    // Take what notify_present reads from the pNext chain before calling down:
++    // the chain must not be walked after the call, because a driver has been
++    // seen leaving a link into its own, by then dead, stack frame (RADV with a
++    // present ID). The present ID is kept as a VkPresentIdKHR with no pNext;
++    // VkPresentId2KHR has the same layout, so it is accepted too. Its sType is
++    // given by value to build against headers that predate it.
++    assert(present_info);
++    constexpr auto STRUCTURE_TYPE_PRESENT_ID_2_KHR =
++        static_cast<VkStructureType>(1000479001);
++    auto present_id = VkPresentIdKHR{};
++    auto notify_info = *present_info;
++    notify_info.pNext = nullptr;
++    for (auto s = static_cast<const VkBaseInStructure*>(present_info->pNext);
++         s; s = s->pNext) {
++        if (s->sType == VK_STRUCTURE_TYPE_PRESENT_ID_KHR ||
++            s->sType == STRUCTURE_TYPE_PRESENT_ID_2_KHR) {
++            present_id = *reinterpret_cast<const VkPresentIdKHR*>(s);
++            present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
++            present_id.pNext = nullptr;
++            notify_info.pNext = &present_id;
++            break;
++        }
++    }
++
+     const auto result = vtable.QueuePresentKHR(queue, present_info);
+ 
+     // We must *ALWAYS* notify_present regardless of the error here.
+-    assert(present_info);
+     if (context->strategy) {
+-        context->strategy->notify_present(*present_info);
++        context->strategy->notify_present(notify_info);
+     }
+ 
+     return result;
