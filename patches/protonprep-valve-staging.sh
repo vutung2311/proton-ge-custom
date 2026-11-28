@@ -815,6 +815,9 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- server: runtime gates for thread priority->nice mapping and main-thread boost"
     apply_patch "../patches/wine-hotfixes/pending/0002-server-gate-thread-priority-nice-and-boost.patch"
 
+    echo "WINE: -CUSTOM- winepulse: retry a failed stream connect with default attributes"
+    apply_patch "../patches/wine-hotfixes/pending/0003-winepulse-fallback-connect.patch"
+
 ### END CUSTOM RUNNER PATCHES ###
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"

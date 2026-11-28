@@ -1,0 +1,42 @@
+Subject: [PATCH] winepulse: retry a failed stream connect with default attributes
+
+If the initial pa_stream_connect_{playback,record}() with our computed buffer
+attributes fails, recreate the stream and retry once with server-default
+attributes instead of failing the endpoint outright.
+
+Rebased onto the GE tree (after the proton-ds5-haptic patches), which already
+guards a NULL pulse_name and wraps this in pulse_stream_connect_timeout(). The
+retry recreates the stream with plain pa_stream_new(), i.e. without the
+target.object property list used for split DualSense haptic nodes.
+---
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -2758,10 +2758,24 @@
+     if (stream->dataflow == eRender)
+         ret = pa_stream_connect_playback(stream->stream, pulse_name, &attr, flags|PA_STREAM_VARIABLE_RATE, NULL, NULL);
+     else
+-        ret = pa_stream_connect_record(stream->stream, pulse_name, &attr, flags);
++        ret = pa_stream_connect_record(stream->stream, pulse_name, &attr, flags|PA_STREAM_VARIABLE_RATE|PA_STREAM_EARLY_REQUESTS);
+     if (ret < 0) {
+-        WARN("Returns %i\n", ret);
+-        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        WARN("Initial connect returned %i, retrying with default attributes\n", ret);
++        pa_stream_disconnect(stream->stream);
++        pa_stream_unref(stream->stream);
++        stream->stream = pa_stream_new(pulse_ctx, buffer, &stream->ss, &stream->map);
++        if (!stream->stream) return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        pa_stream_set_state_callback(stream->stream, pulse_stream_state, stream);
++        pa_stream_set_buffer_attr_callback(stream->stream, pulse_attr_update, stream);
++        pa_stream_set_moved_callback(stream->stream, pulse_attr_update, stream);
++        if (stream->dataflow == eRender)
++            ret = pa_stream_connect_playback(stream->stream, pulse_name, NULL, (flags & ~PA_STREAM_ADJUST_LATENCY)|PA_STREAM_VARIABLE_RATE, NULL, NULL);
++        else
++            ret = pa_stream_connect_record(stream->stream, pulse_name, NULL, (flags & ~PA_STREAM_ADJUST_LATENCY)|PA_STREAM_VARIABLE_RATE|PA_STREAM_EARLY_REQUESTS);
++        if (ret < 0) {
++            WARN("Fallback connect returns %i\n", ret);
++            return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        }
+     }
+     while (stream->stream && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
+     {
