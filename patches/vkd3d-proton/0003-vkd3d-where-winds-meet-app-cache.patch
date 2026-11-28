@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Antigravity <antigravity@google.com>
+Date: Sun, 6 Sep 2026 11:15:00 +0700
+Subject: [PATCH] vkd3d: add streaming allocator and pipeline cache quirks for wwm.exe
+
+Where Winds Meet (wwm.exe) benefits from bypassing host/device memory zeroing
+during heavy level streaming, ignoring mismatched Windows-driver signatures in
+application CachedPSO blobs, recycling command pools, and enforcing the global
+persistent pipeline cache stream archive.
+
+Rebased onto vkd3d-proton d6659d8b, which moved the application override
+table from device_workarounds.c into vkd3d_proton_app_workarounds.json
+(turned into a header by programs/generate_app_workarounds.py).
+---
+ libs/vkd3d/vkd3d_proton_app_workarounds.json | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/libs/vkd3d/vkd3d_proton_app_workarounds.json b/libs/vkd3d/vkd3d_proton_app_workarounds.json
+--- a/libs/vkd3d/vkd3d_proton_app_workarounds.json
++++ b/libs/vkd3d/vkd3d_proton_app_workarounds.json
+@@ -29,6 +29,17 @@
+       "SteamAppID" : "1245620"
+     },
+     {
++      "_comment": [
++        "Where Winds Meet (wwm.exe).",
++        "Skip memory zeroing during heavy level streaming, tolerate mismatched",
++        "driver signatures in application CachedPSO blobs without logging or errors,",
++        "recycle command pools to avoid allocator churn, and enforce the global",
++        "pipeline cache stream archive."
++      ],
++      "configEnable" : [ "MEMORY_ALLOCATOR_SKIP_CLEAR", "MEMORY_ALLOCATOR_SKIP_IMAGE_HEAP_CLEAR", "PIPELINE_LIBRARY_IGNORE_MISMATCH_DRIVER", "RECYCLE_COMMAND_POOLS", "GLOBAL_PIPELINE_CACHE", "NO_STAGGERED_SUBMIT" ],
++      "name" : "wwm.exe"
++    },
++    {
+       "configEnable" : [ "FORCE_NO_INVARIANT_POSITION", "SMALL_VRAM_REBAR" ],
+       "name" : "Sam4.exe"
+     },
